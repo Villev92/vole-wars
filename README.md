@@ -10,11 +10,16 @@ See `CLAUDE.md` for a deeper architecture writeup (terrain/physics internals, ne
 
 ## Setup & running
 
-Requires Node.js and npm (workspaces support).
+Requires Node.js and npm (workspaces support), plus [Git LFS](https://git-lfs.com/) for the image assets.
 
 ```bash
+git lfs install   # one-time per machine, if you haven't used Git LFS before
+git clone https://github.com/Villev92/vole-wars.git
+cd vole-wars
 npm install
 ```
+
+> If you cloned before installing Git LFS, the art files under `apps/client/public/art/` and `designs/` will be small text pointer files instead of images — run `git lfs pull` after installing Git LFS to fetch the real content.
 
 Then run the server and client in two separate terminals (both must be running together — there's no combined dev script):
 
