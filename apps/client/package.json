@@ -1,0 +1,20 @@
+{
+  "name": "@vole-wars/client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vole-wars/shared": "*",
+    "colyseus.js": "^0.16.22",
+    "pixi.js": "^8.2.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vite": "^5.3.4"
+  }
+}

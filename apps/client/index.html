@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vole Wars</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #101418;
+        overflow: hidden;
+        height: 100%;
+      }
+      #app {
+        width: 100vw;
+        height: 100vh;
+      }
+      #hud {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        color: #d7e0e8;
+        font: 13px monospace;
+        pointer-events: none;
+        white-space: pre;
+      }
+      #fps {
+        position: fixed;
+        top: 8px;
+        right: 10px;
+        color: #8fe38f;
+        font: 13px monospace;
+        pointer-events: none;
+        white-space: pre;
+      }
+      #scoreboard {
+        display: none;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        min-width: 260px;
+        padding: 14px 18px;
+        background: rgba(16, 20, 24, 0.88);
+        border: 1px solid #59524a;
+        border-radius: 8px;
+        color: #d7e0e8;
+        font: 13px monospace;
+        pointer-events: none;
+        white-space: pre;
+      }
+      #scoreboard .title {
+        color: #8fe38f;
+        font-weight: bold;
+        margin-bottom: 6px;
+        display: block;
+      }
+      #winner-banner {
+        display: none;
+        position: fixed;
+        top: 30%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        padding: 18px 36px;
+        background: rgba(16, 20, 24, 0.88);
+        border: 2px solid #8fe38f;
+        border-radius: 10px;
+        color: #8fe38f;
+        font: bold 24px monospace;
+        text-align: center;
+        pointer-events: none;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">connecting...</div>
+    <div id="fps">-- fps</div>
+    <div id="hint" style="position: fixed; bottom: 8px; right: 10px; color: #9aa4ad; font: 12px monospace; pointer-events: none">
+      hold Tab for scoreboard
+    </div>
+    <div id="scoreboard"></div>
+    <div id="winner-banner"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

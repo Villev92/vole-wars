@@ -1,0 +1,22 @@
+{
+  "name": "@vole-wars/server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vole-wars/shared": "*",
+    "@colyseus/core": "0.16.5",
+    "@colyseus/schema": "^3.0.76",
+    "@colyseus/ws-transport": "^0.16.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}
