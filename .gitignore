@@ -2,3 +2,14 @@ node_modules/
 dist/
 .DS_Store
 *.log
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
