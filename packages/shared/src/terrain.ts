@@ -82,6 +82,43 @@ export class TerrainField {
   }
 
   /**
+   * Carves a capsule — a circle of `radius` swept along the segment from (x1,y1) to (x2,y2) — out of
+   * destructible dirt/stone, same "rock is unaffected" rule as carveCircle. Used for a piercing
+   * projectile's per-tick travel: carveCircle alone only clears a pocket at the endpoint, leaving the
+   * rest of that tick's swept path untouched, which is wrong for a weapon meant to destroy everything
+   * along its whole flight rather than just where it finally stops.
+   */
+  carveCapsule(x1: number, y1: number, x2: number, y2: number, radius: number): CarveRect {
+    const minX = Math.max(0, Math.floor(Math.min(x1, x2) - radius));
+    const maxX = Math.min(this.width - 1, Math.ceil(Math.max(x1, x2) + radius));
+    const minY = Math.max(0, Math.floor(Math.min(y1, y2) - radius));
+    const maxY = Math.min(this.height - 1, Math.ceil(Math.max(y1, y2) + radius));
+    const segDx = x2 - x1;
+    const segDy = y2 - y1;
+    const lenSq = segDx * segDx + segDy * segDy;
+    const r2 = radius * radius;
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        // Distance from (x,y) to the nearest point on the segment.
+        let px = x1;
+        let py = y1;
+        if (lenSq > 1e-6) {
+          const t = Math.max(0, Math.min(1, ((x - x1) * segDx + (y - y1) * segDy) / lenSq));
+          px = x1 + segDx * t;
+          py = y1 + segDy * t;
+        }
+        const dx = x - px;
+        const dy = y - py;
+        if (dx * dx + dy * dy <= r2) {
+          const material = this.get(x, y);
+          if (material === TERRAIN_DIRT || material === TERRAIN_STONE) this.set(x, y, TERRAIN_EMPTY);
+        }
+      }
+    }
+    return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+  }
+
+  /**
    * Sweeps a circle of varying radius along a slowly-turning random walk, calling `stamp` at each
    * stop. Used for both the open paths and the stone patches below — a handful of deliberate,
    * organic-looking blobby regions by construction, instead of leaving it to chance the way

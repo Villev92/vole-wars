@@ -35,6 +35,21 @@
         pointer-events: none;
         white-space: pre;
       }
+      #volume-control {
+        position: fixed;
+        top: 30px;
+        right: 10px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: #d7e0e8;
+        font: 13px monospace;
+      }
+      #volume-control input[type="range"] {
+        width: 90px;
+        accent-color: #8fe38f;
+        cursor: pointer;
+      }
       #scoreboard {
         display: none;
         position: fixed;
@@ -79,6 +94,10 @@
     <div id="app"></div>
     <div id="hud">connecting...</div>
     <div id="fps">-- fps</div>
+    <div id="volume-control">
+      <span>vol</span>
+      <input id="volume-slider" type="range" min="0" max="100" step="1" />
+    </div>
     <div id="hint" style="position: fixed; bottom: 8px; right: 10px; color: #9aa4ad; font: 12px monospace; pointer-events: none">
       hold Tab for scoreboard
     </div>

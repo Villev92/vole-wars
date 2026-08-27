@@ -314,6 +314,13 @@ export class TerrainRenderer {
     const rect = this.terrain.carveCircle(cx, cy, radius);
     this.redrawRect(rect.x, rect.y, rect.width, rect.height);
   }
+
+  /** Same idea as carve() above, but for a piercing weapon's per-tick capsule (see
+   *  TerrainField.carveCapsule) instead of a single circle. */
+  carveCapsule(x1: number, y1: number, x2: number, y2: number, radius: number): void {
+    const rect = this.terrain.carveCapsule(x1, y1, x2, y2, radius);
+    this.redrawRect(rect.x, rect.y, rect.width, rect.height);
+  }
 }
 
 function inBounds(x: number, y: number, width: number, height: number): boolean {

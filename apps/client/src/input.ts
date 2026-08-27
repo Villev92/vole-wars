@@ -9,6 +9,8 @@ export class InputTracker {
   private grapple = false;
   private aimAngle = 0;
   private firePending = false;
+  private fireHeld = false;
+  private suppressFire = false;
 
   private onFire: () => void;
 
@@ -36,15 +38,25 @@ export class InputTracker {
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     canvas.addEventListener("mousedown", (e) => {
-      if (e.button === 0) this.firePending = true;
+      if (e.button === 0) {
+        // A click that just selected a weapon slot (Pixi HUD, drawn on this same canvas) also
+        // reaches here as a plain left-press — suppressNextFire() flags it so it doesn't shoot.
+        if (this.suppressFire) this.suppressFire = false;
+        else this.firePending = true;
+        // Separate from the firePending edge: the flamethrower streams for as long as this stays
+        // true (see main.ts). Set even on a suppressed slot-click — the release still clears it.
+        this.fireHeld = true;
+      }
       if (e.button === 2) this.grapple = true;
     });
     canvas.addEventListener("mouseup", (e) => {
+      if (e.button === 0) this.fireHeld = false;
       if (e.button === 2) this.grapple = false;
     });
-    // Releasing right-click outside the canvas (e.g. dragged off-window) would otherwise leave
-    // grapple stuck on forever, since that mouseup never reaches the canvas listener above.
+    // Releasing a button outside the canvas (e.g. dragged off-window) would otherwise leave grapple
+    // (or the flamethrower stream) stuck on forever, since that mouseup never reaches the canvas.
     window.addEventListener("mouseup", (e) => {
+      if (e.button === 0) this.fireHeld = false;
       if (e.button === 2) this.grapple = false;
     });
 
@@ -55,15 +67,30 @@ export class InputTracker {
     this.onFire = handler;
   }
 
+  /** Cancels the very next left-press so a weapon-slot click doesn't also fire (see the mousedown
+   * listener). Safe to call unconditionally on every slot click — the flag is consumed by the one
+   * canvas press that immediately follows. */
+  suppressNextFire(): void {
+    this.suppressFire = true;
+  }
+
+  /** Whether the left mouse button is currently held down — drives the flamethrower's continuous
+   *  stream (every other weapon uses the one-shot fire handler / firePending edge instead). */
+  isFireHeld(): boolean {
+    return this.fireHeld;
+  }
+
   private handleKey(code: string, down: boolean): void {
     if (code === "ArrowLeft" || code === "KeyA") this.left = down;
     if (code === "ArrowRight" || code === "KeyD") this.right = down;
     if (code === "ArrowUp" || code === "KeyW") this.up = down;
     if (code === "ArrowDown" || code === "KeyS") this.down = down;
-    if ((code === "Space" || code === "ArrowUp" || code === "KeyW") && down && !this.jump) {
+    // Space only — ArrowUp/KeyW used to double as jump too, but they're also "up" (rope reel-in),
+    // so holding W to reel in a grapple was silently also arming a jump the instant you landed.
+    if (code === "Space" && down && !this.jump) {
       this.jump = true;
     }
-    if ((code === "Space" || code === "ArrowUp" || code === "KeyW") && !down) {
+    if (code === "Space" && !down) {
       this.jump = false;
     }
   }

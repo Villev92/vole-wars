@@ -1,4 +1,6 @@
 import { Graphics } from "pixi.js";
+import { WEAPONS } from "@vole-wars/shared";
+import { ENTITY_SCALE } from "./voleArt.js";
 
 /** Draws a small rocket, local +x = direction of travel (the graphic is rotated to the bullet's heading). */
 export function drawBullet(g: Graphics): void {
@@ -154,4 +156,31 @@ export function drawMineImpactFlash(g: Graphics, t: number): void {
   g.circle(0, 0, 3 + grow * 11).fill({ color: 0xb3282a, alpha: fade * 0.5 });
   g.circle(0, 0, 1.5 + grow * 6).fill({ color: 0xff8a3d, alpha: fade * 0.6 });
   g.circle(0, 0, 1 + grow * 3).fill({ color: 0xffe3a3, alpha: fade * 0.85 });
+}
+
+// The flash's outer edge is locked to bazooka's actual carveRadius (the crater it leaves in the
+// terrain) rather than an independently-tuned magic number, so the visual can never drift out of
+// sync with the real destruction radius — it grows to exactly the size of the hole it just made.
+// carveRadius is in terrain units, but everything drawn in this file (and every other draw*
+// function here) is in vole-local units, which main.ts/bullets.ts scale DOWN by ENTITY_SCALE
+// (0.225) at render time — drawing carveRadius directly, unconverted, was rendering a flash about
+// 1/0.225 (~4.4x) smaller than the real crater. Dividing by ENTITY_SCALE here undoes that ahead of
+// time so the two end up the same size on screen.
+const BAZOOKA_CRATER_RADIUS = WEAPONS.bazooka.carveRadius / ENTITY_SCALE;
+// Drawn a bit past the crater's own edge (not capped exactly to it) and noticeably softer/more
+// translucent than a flat opaque blob — a crater-matched, fully-opaque flash read as too small and
+// too solid to actually register as an explosion. This is purely visual; the real destruction
+// radius is still exactly carveRadius (BAZOOKA_CRATER_RADIUS above), untouched.
+const BAZOOKA_FLASH_SCALE = 1.35;
+
+/** Bazooka's own impact — a proper rocket-explosion blast: a bold red outer ring collapsing into a
+ *  bright yellow core, rather than the default flash's muted orange, sized off the crater (see
+ *  BAZOOKA_CRATER_RADIUS/BAZOOKA_FLASH_SCALE above). t goes 0 -> 1. */
+export function drawBazookaExplosion(g: Graphics, t: number): void {
+  const grow = 1 - Math.pow(1 - t, 2);
+  const fade = 1 - t;
+  const r = BAZOOKA_CRATER_RADIUS * BAZOOKA_FLASH_SCALE;
+  g.circle(0, 0, r * 0.25 + grow * r * 0.75).fill({ color: 0xc0342a, alpha: fade * 0.35 });
+  g.circle(0, 0, r * 0.15 + grow * r * 0.46).fill({ color: 0xff8a3d, alpha: fade * 0.5 });
+  g.circle(0, 0, r * 0.08 + grow * r * 0.25).fill({ color: 0xffde5c, alpha: fade * 0.7 });
 }

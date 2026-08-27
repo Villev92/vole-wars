@@ -1,21 +1,24 @@
-import { Application, Container, Graphics } from "pixi.js";
+import { Application, BlurFilter, ColorMatrixFilter, Container, Graphics, type ColorMatrix } from "pixi.js";
 import { getStateCallbacks } from "colyseus.js";
 import {
+  DEFAULT_WEAPON_ID,
   TERRAIN_STONE,
   TerrainField,
+  WEAPONS,
   type PlayerInput,
   type ProjectileSimState,
   type VoleHitTarget,
 } from "@vole-wars/shared";
-import { connect, requestTerrain, sendFire, sendInput } from "./net.js";
+import { connect, requestTerrain, sendFire, sendFlame, sendInput } from "./net.js";
 import { TerrainRenderer, DIRT_COLOR, STONE_COLOR } from "./terrainRenderer.js";
 import { BloodRenderer } from "./bloodRenderer.js";
 import { createCaveBackground } from "./caveBackground.js";
-import { drawSkeleton } from "./skeletonArt.js";
+import { createSkeleton, loadSkeletonTexture } from "./skeletonArt.js";
 import { InputTracker } from "./input.js";
 import { createFoot, createGun, createHead, createTorso, loadVoleTextures, setGunVisual, ENTITY_SCALE, GUN_SHOULDER_OFFSET } from "./voleArt.js";
 import {
   drawAkBullet,
+  drawBazookaExplosion,
   drawBullet,
   drawFlameBullet,
   drawGrenadeBullet,
@@ -31,7 +34,26 @@ import {
 } from "./bulletArt.js";
 import { BulletLayer } from "./bullets.js";
 import { ParticleLayer } from "./particles.js";
-import { playGunshot, unlockAudio } from "./sound.js";
+import { FlameLayer, type BurnMarker, type FlamingVole } from "./flame.js";
+import { GrenadeAimGuide } from "./grenadeAim.js";
+import { DamageNumberLayer } from "./damageNumbers.js";
+import {
+  getMasterVolume,
+  playAkGunshot,
+  playBazookaExplosion,
+  playBazookaFire,
+  playGrenadeBounce,
+  playGrenadeExplosion,
+  playGrenadeSokka,
+  playGrenadeThrow,
+  playGrunt,
+  playSniperShot,
+  playTerrainImpact,
+  setMasterVolume,
+  startFlameLoop,
+  stopFlameLoop,
+  unlockAudio,
+} from "./sound.js";
 import { WeaponSelector } from "./weaponSelector.js";
 import { loadWeaponIconTextures, type TexturedWeaponId } from "./weaponIcons.js";
 
@@ -42,7 +64,19 @@ const PLAYER_COLORS = [0x4caf50, 0xef5350, 0x42a5f5, 0xffca28];
 // each view keeps its own smoothed "render" pose that eases toward the latest server pose every
 // animation frame, so movement reads as fluid regardless of network tick rate or jitter.
 const POSITION_SMOOTH_RATE = 18;
+// The local player's own vole uses a much snappier rate than remote ones (below): there's no network
+// jitter to hide for input you just pressed yourself, so the same easing that keeps a REMOTE player's
+// motion from stepping just reads as input lag on your own character — most noticeable on jump, a
+// sudden velocity reversal, where the ~55ms time constant POSITION_SMOOTH_RATE=18 works out to (95%
+// caught up only after ~165ms) was the actual source of "pressing space doesn't feel instant", not
+// the underlying physics (JUMP_SPEED launches at full speed the very tick it triggers, no ramp-up).
+const LOCAL_POSITION_SMOOTH_RATE = 55;
 const ANGLE_SMOOTH_RATE = 22;
+// Shift+scroll zoom (see zoomLevel below) is a core play loop, not just a nice-to-have — scrolled
+// out to scout, zoomed in to fight — so snapping straight to each wheel tick's target reads as
+// jarring exactly when the player is mid-fight. renderZoom eases toward zoomLevel the same way
+// vole poses ease toward server state, so the zoom itself glides instead of stepping.
+const ZOOM_SMOOTH_RATE = 9;
 
 // Walk cycle: near/far feet swing fore/aft and lift on alternating halves of one sine, in vole-local
 // units (see voleArt.ts's header for that unit system) added on top of their own static hip-spread
@@ -73,7 +107,7 @@ const INPUT_SEND_INTERVAL = 1 / INPUT_SEND_RATE;
 // than a grip point on a barrel. missile's art is a bare rocket (no gun body at all) — anchored
 // mid-body near the fins, same idea as gripping a held rocket by hand like the grenade/mine.
 const HELD_WEAPON_VISUALS: Record<TexturedWeaponId, { anchorX: number; anchorY: number; scale: number }> = {
-  ak47: { anchorX: 0.298, anchorY: 0.662, scale: 0.038 },
+  ak47: { anchorX: 0.298, anchorY: 0.662, scale: 0.034 },
   bazooka: { anchorX: 0.413, anchorY: 0.647, scale: 0.045 },
   sniper: { anchorX: 0.41, anchorY: 0.66, scale: 0.042 },
   railgun: { anchorX: 0.37, anchorY: 0.65, scale: 0.044 },
@@ -85,12 +119,14 @@ const HELD_WEAPON_VISUALS: Record<TexturedWeaponId, { anchorX: number; anchorY: 
   missile: { anchorX: 0.42, anchorY: 0.5, scale: 0.046 },
 };
 
-// Per-weapon flight/impact visuals for the "fire" broadcast below — falls back to the bazooka's
-// rocket + default orange flash for any weapon without its own entry (every WEAPON_IDS slot has one
-// now — see weapons.ts — so this fallback is currently unreachable, kept as a safety net).
+// Per-weapon flight/impact visuals for the "fire" broadcast below — falls back to the bazooka's own
+// plain rocket art + the default orange flash for any weapon without its own entry (every
+// WEAPON_IDS slot has one now — see weapons.ts — so this fallback is currently unreachable, kept as
+// a safety net).
 const BULLET_VISUALS: Partial<Record<string, { draw: (g: Graphics) => void; impact: (g: Graphics, t: number) => void }>> = {
   ak47: { draw: drawAkBullet, impact: drawImpactFlash },
   sniper: { draw: drawSniperBullet, impact: drawImpactFlash },
+  bazooka: { draw: drawBullet, impact: drawBazookaExplosion },
   railgun: { draw: drawRailgunBullet, impact: drawRailgunImpactFlash },
   flamethrower: { draw: drawFlameBullet, impact: drawImpactFlash },
   grenade: { draw: drawGrenadeBullet, impact: drawImpactFlash },
@@ -101,13 +137,57 @@ const BULLET_VISUALS: Partial<Record<string, { draw: (g: Graphics) => void; impa
 };
 const DEFAULT_BULLET_VISUAL = { draw: drawBullet, impact: drawImpactFlash };
 
+// A blue self-marker for the local player only, so a glance is enough to tell which character is
+// yours: a clone of the character rig sitting behind the real one, flattened to a solid blue
+// silhouette (ColorMatrixFilter) then given a narrow blur (BlurFilter) so only a bright rim peeks
+// out around the sharp real art — a glowing outline tracing the body, head and feet. The gun is
+// deliberately NOT cloned: a long barrel swinging past vertical stretched the filter region into a
+// thin sliver and the blur clamped at its edge, leaving a blue streak trailing off the muzzle.
+const GLOW_COLOR = 0x6ab8ff;
+const GLOW_BLUR = 3.3;
+interface GlowRig {
+  container: Container;
+  farFoot: Container;
+  torso: Container;
+  head: Container;
+  nearFoot: Container;
+}
+
+/**
+ * A ColorMatrixFilter matrix that replaces every pixel's RGB with a flat colour while keeping its
+ * original alpha — turns the textured rig clone into a solid-colour silhouette the blur can work on
+ * (a plain multiply `tint` would only darken the tan art toward navy, not give a bright emitter).
+ */
+function solidColorMatrix(color: number): ColorMatrix {
+  const r = ((color >> 16) & 0xff) / 255;
+  const g = ((color >> 8) & 0xff) / 255;
+  const b = (color & 0xff) / 255;
+  // prettier-ignore
+  return [
+    0, 0, 0, 0, r,
+    0, 0, 0, 0, g,
+    0, 0, 0, 0, b,
+    0, 0, 0, 1, 0,
+  ] as ColorMatrix;
+}
+
+/** Copies a real rig part's per-frame transform onto its glow clone. */
+function copyPartTransform(twin: Container, real: Container): void {
+  twin.position.copyFrom(real.position);
+  twin.scale.copyFrom(real.scale);
+  twin.rotation = real.rotation;
+  twin.visible = real.visible;
+}
+
 interface VoleView {
+  glow: GlowRig | null;
   farFoot: Container;
   torso: Container;
   head: Container;
   nearFoot: Container;
   gun: Container;
   hp: Graphics;
+  cooldown: Graphics;
   rope: Graphics;
   facing: 1 | -1;
   renderX: number;
@@ -117,6 +197,21 @@ interface VoleView {
   lastWeaponId: string;
   walkAmount: number;
   lastHpKey: string;
+}
+
+// Small in-world echo of the weapon not being fireable yet, parked right next to the local player's
+// own character (see renderVole) — a solid blue disc that starts as a full circle right after firing
+// and loses that blue area clockwise from the top as the cooldown counts down, down to nothing once
+// it's ready again. Same wipe math as WeaponSelector.setCooldown's preview-panel version, just a
+// different look (filled blue rather than a dark overlay) since this one reads against the terrain
+// instead of the HUD panel's own background.
+const SMALL_COOLDOWN_RADIUS = 4;
+function drawSmallCooldown(g: Graphics, ratio: number): void {
+  g.clear();
+  if (ratio <= 0) return;
+  const start = -Math.PI / 2;
+  const end = start + ratio * Math.PI * 2;
+  g.moveTo(0, 0).arc(0, 0, SMALL_COOLDOWN_RADIUS, start, end).lineTo(0, 0).fill({ color: 0x2f8fef, alpha: 0.9 });
 }
 
 function shortestAngleDelta(from: number, to: number): number {
@@ -149,10 +244,23 @@ async function main(): Promise<void> {
 
   window.addEventListener("pointerdown", unlockAudio, { once: true });
 
+  // Volume slider (top-right, see index.html) — starts at whatever was last saved (or a sensible
+  // default if nothing was), and dragging it both sets the live master gain and remembers the
+  // choice via setMasterVolume itself (see sound.ts). "input" rather than "change" so it responds
+  // continuously while dragging, not just on release.
+  const volumeSlider = document.getElementById("volume-slider") as HTMLInputElement;
+  volumeSlider.value = String(Math.round(getMasterVolume() * 100));
+  volumeSlider.addEventListener("input", () => setMasterVolume(Number(volumeSlider.value) / 100));
+
   document.addEventListener("gesturestart", (e) => e.preventDefault());
 
   hud.textContent = "connecting to server...";
-  const [room, voleTextures, weaponIconTextures] = await Promise.all([connect(), loadVoleTextures(), loadWeaponIconTextures()]);
+  const [room, voleTextures, weaponIconTextures, skeletonTexture] = await Promise.all([
+    connect(),
+    loadVoleTextures(),
+    loadWeaponIconTextures(),
+    loadSkeletonTexture(),
+  ]);
   hud.textContent = `connected (session ${room.sessionId})`;
 
   const weaponSelector = new WeaponSelector(weaponIconTextures);
@@ -172,7 +280,10 @@ async function main(): Promise<void> {
   const MIN_ZOOM = 1; // today's fully-zoomed-out "cover the window" view
   const MAX_ZOOM = 5;
   const ZOOM_STEP = 1.12;
+  // zoomLevel is the target the wheel handler jumps immediately; renderZoom (what applyCamera
+  // actually draws with) eases toward it every frame — see ZOOM_SMOOTH_RATE.
   let zoomLevel = MIN_ZOOM;
+  let renderZoom = MIN_ZOOM;
 
   // Ctrl+scroll (and trackpad pinch, which browsers report as a wheel event with ctrlKey set)
   // triggers native browser page zoom. That scales DOM elements (HUD, respawn button) and Pixi's
@@ -246,12 +357,37 @@ async function main(): Promise<void> {
     // Near foot sits centered under the torso's hip/leg nub (spreadX 0 lands it right on
     // HIP_OFFSET.x, the nub's own x); far foot is offset back+up just enough to peek out from
     // behind it, instead of the wide near/far stance the old traced legs had.
+    // Only the local player's own vole gets the blue self-marker (see GlowRig) — the whole point is
+    // to pick your own character out, so tagging every vole would defeat it. It's a full second copy
+    // of the rig, blue-tinted, blurred, and parked behind the real one; renderVole copies each real
+    // part's transform onto its twin every frame so the two stay locked together.
+    const glow: GlowRig | null =
+      sessionId === room.sessionId
+        ? {
+            container: new Container(),
+            farFoot: createFoot(voleTextures, -1.4, -0.4),
+            torso: createTorso(voleTextures),
+            head: createHead(voleTextures, color),
+            nearFoot: createFoot(voleTextures, 0, 0),
+          }
+        : null;
+    if (glow) {
+      glow.container.addChild(glow.farFoot, glow.torso, glow.head, glow.nearFoot);
+      const solid = new ColorMatrixFilter();
+      solid.matrix = solidColorMatrix(GLOW_COLOR);
+      // Flatten to a solid blue silhouette first, then blur that — order matters.
+      glow.container.filters = [solid, new BlurFilter({ strength: GLOW_BLUR, quality: 3 })];
+    }
     const farFoot = createFoot(voleTextures, -1.4, -0.4);
     const torso = createTorso(voleTextures);
     const head = createHead(voleTextures, color);
     const nearFoot = createFoot(voleTextures, 0, 0);
     const gun = createGun(voleTextures);
     const hp = new Graphics();
+    // Small in-world echo of the weapon-preview panel's cooldown wipe (see WeaponSelector.setCooldown)
+    // parked beside the HP bar — only ever drawn for the local player's own view (see renderVole),
+    // since a cooldown timer only means anything for the weapon you're personally holding.
+    const cooldown = new Graphics();
     // Unlike the other parts, the rope line is drawn in absolute world/terrain coordinates (both
     // endpoints already are), not vole-local units, so it deliberately gets no entityScale here.
     const rope = new Graphics();
@@ -261,17 +397,22 @@ async function main(): Promise<void> {
     nearFoot.scale.set(entityScale);
     gun.scale.set(entityScale);
     hp.scale.set(entityScale);
+    cooldown.scale.set(entityScale);
     // z-order: far foot mostly hidden behind the torso, head drawn over the torso's neck seam, near
     // foot and gun in front of everything else — same layering the old traced art used. The rope
     // goes in first so the character rig draws on top of it near the attach hand.
-    world.addChild(rope, farFoot, torso, head, nearFoot, gun, hp);
+    // Glow clone first so it sits behind the whole rig (but still above the terrain/blood layers).
+    if (glow) world.addChild(glow.container);
+    world.addChild(rope, farFoot, torso, head, nearFoot, gun, hp, cooldown);
     const view: VoleView = {
+      glow,
       farFoot,
       torso,
       head,
       nearFoot,
       gun,
       hp,
+      cooldown,
       rope,
       facing: 1,
       renderX: vole.x,
@@ -305,7 +446,7 @@ async function main(): Promise<void> {
   ): void {
     const view = voleViews.get(sessionId) ?? makeVoleView(sessionId, vole);
 
-    const posEase = easeFactor(POSITION_SMOOTH_RATE, dt);
+    const posEase = easeFactor(sessionId === room.sessionId ? LOCAL_POSITION_SMOOTH_RATE : POSITION_SMOOTH_RATE, dt);
     view.renderX += (vole.x - view.renderX) * posEase;
     view.renderY += (vole.y - view.renderY) * posEase;
     view.renderAngle += shortestAngleDelta(view.renderAngle, vole.aimAngle) * easeFactor(ANGLE_SMOOTH_RATE, dt);
@@ -383,12 +524,24 @@ async function main(): Promise<void> {
       const selectedId = weaponSelector.selectedId;
       view.lastWeaponId = selectedId;
       const visual = HELD_WEAPON_VISUALS[selectedId];
-      setGunVisual(view.gun, {
+      const gunVisual = {
         texture: weaponIconTextures[selectedId],
         anchorX: visual.anchorX,
         anchorY: visual.anchorY,
         scale: visual.scale,
-      });
+      };
+      setGunVisual(view.gun, gunVisual);
+    }
+
+    // Blue self-marker (local player only): lock every glow-clone part onto its real counterpart so
+    // the blurred blue silhouette stays exactly behind the live art, showing only as a rim.
+    if (view.glow) {
+      const g = view.glow;
+      copyPartTransform(g.farFoot, view.farFoot);
+      copyPartTransform(g.torso, view.torso);
+      copyPartTransform(g.head, view.head);
+      copyPartTransform(g.nearFoot, view.nearFoot);
+      g.container.visible = vole.alive;
     }
 
     const barWidth = 16;
@@ -403,6 +556,24 @@ async function main(): Promise<void> {
     view.hp.position.set(view.renderX, view.renderY);
     view.hp.scale.set(entityScale);
     view.hp.visible = vole.alive;
+
+    // Only the local player gets this — a cooldown timer for another player's weapon isn't
+    // something the server tells us (or something the player needs to see), so it stays hidden.
+    // ak47 fires fast enough (fireCooldown 0.15s) that this indicator was mostly just flickering
+    // noise next to the character rather than a readable cooldown timer — hidden for it entirely.
+    if (sessionId === room.sessionId && weaponSelector.selectedId !== "ak47") {
+      const weapon = WEAPONS[weaponSelector.selectedId] ?? WEAPONS[DEFAULT_WEAPON_ID];
+      const lastFire = lastFireAt.get(weaponSelector.selectedId) ?? -Infinity;
+      const ratio = Math.max(0, Math.min(1, 1 - (time - lastFire) / weapon.fireCooldown));
+      drawSmallCooldown(view.cooldown, ratio);
+      // Close to the character, tucked just above and behind (opposite whichever way they're
+      // currently facing) rather than out past the HP bar.
+      view.cooldown.position.set(view.renderX - view.facing * 1.5, view.renderY - 6);
+      view.cooldown.scale.set(entityScale);
+      view.cooldown.visible = vole.alive && ratio > 0;
+    } else {
+      view.cooldown.visible = false;
+    }
 
     // Redrawn every frame (rather than cached like the hp bar above) since the vole end moves every
     // frame while swinging — there's no stable "key" to gate a skip on the way the hp bar has.
@@ -432,15 +603,19 @@ async function main(): Promise<void> {
   world.addChildAt(bloodRenderer.sprite, 2);
   const bulletLayer = new BulletLayer(world, terrain);
   const particleLayer = new ParticleLayer(world);
+  const flameLayer = new FlameLayer(world, terrain);
+  const grenadeGuide = new GrenadeAimGuide(world);
+  const damageNumbers = new DamageNumberLayer(world);
 
   // The camera keeps the local player centered and always on-screen, zoomed by zoomLevel (see left
   // Shift + scroll above) on top of the same "cover the window" base scale the fully-zoomed-out view
   // always used. Clamped to the terrain bounds on both axes so zooming in near an edge never shows a
   // gap past the map — at zoomLevel 1 (MIN_ZOOM) that clamp range collapses to exactly the old
   // always-centered-on-the-map behavior, since the map exactly covers the window at that scale.
-  function applyCamera(): void {
+  function applyCamera(dt = 0): void {
+    renderZoom += (zoomLevel - renderZoom) * easeFactor(ZOOM_SMOOTH_RATE, dt);
     const coverScale = Math.max(app.renderer.width / terrain.width, app.renderer.height / terrain.height);
-    const scale = coverScale * zoomLevel;
+    const scale = coverScale * renderZoom;
     world.scale.set(scale);
 
     const selfView = voleViews.get(room.sessionId);
@@ -456,58 +631,108 @@ async function main(): Promise<void> {
     world.position.set(Math.max(minOffsetX, Math.min(0, desiredX)), Math.max(minOffsetY, Math.min(0, desiredY)));
   }
   applyCamera();
-  app.renderer.on("resize", applyCamera);
+  // Explicit () => applyCamera() rather than passing applyCamera directly — Pixi's "resize" event
+  // emits (width, height), which would otherwise land in applyCamera's dt param and make the zoom
+  // ease snap instantly on every window resize instead of gliding.
+  app.renderer.on("resize", () => applyCamera());
 
-  room.onMessage("terrain-carve", (msg: { x: number; y: number; radius: number }) => {
-    // Sampled before carving, since carve() clears the material this explosion is destroying.
+  // A piercing weapon's shot sends several "terrain-carve" messages (one per server tick it spends
+  // tunneling, plus its own final one) that all share the same projectile id — tracks which ids have
+  // already played the impact sound so a single sniper shot doesn't sound like a burst of gunfire.
+  // Ids are never reused and this only grows for the life of the page, but at one entry per shot
+  // fired all game, that's negligible even over a very long session.
+  const soundedProjectileIds = new Set<string>();
+
+  room.onMessage("terrain-carve", (msg: { id?: string; weaponId?: string; x: number; y: number; x2?: number; y2?: number; radius: number }) => {
+    // Sampled before carving, since carve()/carveCapsule() clears the material this destroys.
     const material = terrain.get(Math.floor(msg.x), Math.floor(msg.y));
     const debrisColor = material === TERRAIN_STONE ? STONE_COLOR : DIRT_COLOR;
-    terrainRenderer.carve(msg.x, msg.y, msg.radius);
-    // Destroying terrain destroys any blood sitting on it too (see project spec: blood persists
-    // until the bloody terrain itself is carved away).
-    bloodRenderer.clearCircle(msg.x, msg.y, msg.radius);
-    particleLayer.burst(msg.x, msg.y, debrisColor, Math.round(14 + msg.radius));
+    // x2/y2 present = a piercing weapon's per-tick capsule (see GameRoom.update), not a single
+    // circular explosion — same idea, swept along a segment instead of centered on one point.
+    if (msg.x2 !== undefined && msg.y2 !== undefined) {
+      terrainRenderer.carveCapsule(msg.x, msg.y, msg.x2, msg.y2, msg.radius);
+      const midX = (msg.x + msg.x2) / 2;
+      const midY = (msg.y + msg.y2) / 2;
+      const halfLen = Math.hypot(msg.x2 - msg.x, msg.y2 - msg.y) / 2;
+      // onTerrainCarved's own circle-membership check is only a cheap pre-filter (the real check is
+      // re-testing terrain.isSolid), so a bounding circle around the whole capsule is a safe stand-in
+      // for a dedicated capsule variant.
+      bloodRenderer.onTerrainCarved(midX, midY, halfLen + msg.radius);
+      particleLayer.burst(midX, midY, debrisColor, Math.round(14 + msg.radius));
+    } else {
+      terrainRenderer.carve(msg.x, msg.y, msg.radius);
+      // Blood on terrain that's just been destroyed falls (like a corpse losing its footing) rather
+      // than being erased outright — see BloodRenderer.onTerrainCarved.
+      bloodRenderer.onTerrainCarved(msg.x, msg.y, msg.radius);
+      particleLayer.burst(msg.x, msg.y, debrisColor, Math.round(14 + msg.radius));
+      // A single-circle carve (no x2/y2) is always a projectile's FINAL impact, whether that's a
+      // direct vole hit or hitting terrain — snap this bullet's own local visual straight to the
+      // server's real impact point rather than trusting this client's own in-flight guess, which can
+      // drift enough over a slow shot's flight to visibly sail past a moving target (see
+      // BulletLayer.resolve's own comment for why).
+      if (msg.id !== undefined) bulletLayer.resolve(msg.id, msg.x, msg.y, entityScale);
+    }
+    // At most one impact sound per bullet — see soundedProjectileIds' own comment above. A message
+    // with no id (shouldn't happen now that both server broadcast sites send one, but harmless if
+    // it ever did) just always plays, same as before this existed. Bazooka gets its own recorded
+    // blast instead of the generic synthesized crack+thump every other weapon still uses.
+    if (msg.id === undefined || !soundedProjectileIds.has(msg.id)) {
+      if (msg.id !== undefined) soundedProjectileIds.add(msg.id);
+      if (msg.weaponId === "bazooka") playBazookaExplosion();
+      else if (msg.weaponId === "grenade") playGrenadeExplosion();
+      else playTerrainImpact();
+    }
   });
 
   room.onMessage("fire", (msg: ProjectileSimState) => {
     const visual = BULLET_VISUALS[msg.weaponId] ?? DEFAULT_BULLET_VISUAL;
     bulletLayer.spawn(msg, visual.draw, visual.impact);
-    playGunshot();
+    if (msg.weaponId === "ak47") playAkGunshot();
+    if (msg.weaponId === "sniper") playSniperShot();
+    if (msg.weaponId === "bazooka") playBazookaFire();
   });
 
   room.onMessage("blood", (msg: { x: number; y: number; amount: number }) => {
     bloodRenderer.splatter(msg.x, msg.y, msg.amount);
+    damageNumbers.spawn(msg.x, msg.y, msg.amount);
   });
+
+  // Server sends this (throttled per vole) whenever any player takes flamethrower or fall damage.
+  room.onMessage("grunt", () => playGrunt());
+  // Sent by the server each time a grenade caroms off terrain (see stepProjectile bounce handling).
+  room.onMessage("grenade-bounce", () => playGrenadeBounce());
 
   $(room.state).voles.onRemove((_vole, sessionId) => {
     const view = voleViews.get(sessionId);
     if (view) {
-      world.removeChild(view.rope, view.farFoot, view.torso, view.head, view.nearFoot, view.gun, view.hp);
+      world.removeChild(view.rope, view.farFoot, view.torso, view.head, view.nearFoot, view.gun, view.hp, view.cooldown);
+      if (view.glow) world.removeChild(view.glow.container);
       voleViews.delete(sessionId);
     }
   });
 
   interface CorpseView {
-    graphic: Graphics;
+    container: Container;
     renderX: number;
     renderY: number;
+    renderAngle: number;
   }
   const corpseViews = new Map<string, CorpseView>();
   $(room.state).corpses.onAdd((corpse) => {
-    const graphic = new Graphics();
-    drawSkeleton(graphic);
-    graphic.scale.set(entityScale * corpse.facing, entityScale);
-    graphic.position.set(corpse.x, corpse.y);
+    const container = createSkeleton(skeletonTexture);
+    container.scale.set(entityScale * corpse.facing, entityScale);
+    container.position.set(corpse.x, corpse.y);
+    container.rotation = corpse.angle;
     // Inserted right above the terrain/blood layers (indices 0-2) rather than appended, so a
     // skeleton always renders under every living character's parts, however many of each already
     // exist in the display list.
-    world.addChildAt(graphic, 3);
-    corpseViews.set(corpse.id, { graphic, renderX: corpse.x, renderY: corpse.y });
+    world.addChildAt(container, 3);
+    corpseViews.set(corpse.id, { container, renderX: corpse.x, renderY: corpse.y, renderAngle: corpse.angle });
   });
   $(room.state).corpses.onRemove((corpse) => {
     const view = corpseViews.get(corpse.id);
     if (view) {
-      world.removeChild(view.graphic);
+      world.removeChild(view.container);
       corpseViews.delete(corpse.id);
     }
   });
@@ -520,7 +745,44 @@ async function main(): Promise<void> {
     },
     () => ({ scale: world.scale.x, offsetX: world.position.x, offsetY: world.position.y })
   );
-  input.setFireHandler(() => sendFire(room, weaponSelector.selectedId));
+  // Clicking a weapon slot selects it — but that click also lands on the canvas as a left-press and
+  // would fire the weapon. The slot's pointerdown fires first, so it can veto that press here.
+  weaponSelector.onSlotPointerDown = () => input.suppressNextFire();
+  // Client-side mirror of GameRoom.handleFire's own rate-of-fire cap (same weapon.fireCooldown
+  // constant, same "time since last accepted fire" gate) — the server is still the one that
+  // actually enforces it, this just avoids spamming useless "fire" messages during cooldown and
+  // drives the preview panel's round cooldown indicator (see weaponSelector.setCooldown) without
+  // waiting on a round trip.
+  const lastFireAt = new Map<string, number>();
+  input.setFireHandler(() => {
+    const weaponId = weaponSelector.selectedId;
+    // Neither of these is a one-shot click weapon: the flamethrower is driven by the held-fire
+    // `flame` message, and the grenade by the hold-to-charge / release-to-throw block in the ticker.
+    if (weaponId === "flamethrower" || weaponId === "grenade") return;
+    const weapon = WEAPONS[weaponId] ?? WEAPONS[DEFAULT_WEAPON_ID];
+    const now = performance.now() / 1000;
+    const last = lastFireAt.get(weaponId) ?? -Infinity;
+    if (now - last < weapon.fireCooldown) return;
+    lastFireAt.set(weaponId, now);
+    sendFire(room, weaponId);
+  });
+
+  // Flamethrower: streams while left-click is held, capped at FLAME_MAX_MS per uninterrupted
+  // squeeze (must release and press again for a fresh budget). The client only tells the server
+  // when the hold starts/stops (`flame` message); the server runs the actual stream (GameRoom
+  // updateFlames) and the FlameLayer renders it from the synced `flaming` flag.
+  const FLAME_MAX_MS = 10_000;
+  let flameHoldPrev = false;
+  let flameSqueezeStart = 0;
+  let localFlaming = false;
+
+  // Grenade: hold LMB to charge (further throw the longer you hold), release to throw. A short click
+  // (~0 charge) plops it at the feet. The trajectory preview (grenadeGuide) shows the throw arc
+  // while charging. The server maps the released 0..1 power to a launch speed.
+  const GRENADE_CHARGE_MS = 900;
+  let grenadeHoldPrev = false;
+  let grenadeCharging = false;
+  let grenadeChargeStart = 0;
 
   let inputSendAccumulator = 0;
   let fpsDisplayAccumulator = 0;
@@ -534,6 +796,60 @@ async function main(): Promise<void> {
     if (inputSendAccumulator >= INPUT_SEND_INTERVAL) {
       inputSendAccumulator = 0;
       sendInput(room, playerInput);
+    }
+
+    const selectedWeapon = WEAPONS[weaponSelector.selectedId] ?? WEAPONS[DEFAULT_WEAPON_ID];
+    const lastFire = lastFireAt.get(weaponSelector.selectedId) ?? -Infinity;
+    weaponSelector.setCooldown(1 - (time - lastFire) / selectedWeapon.fireCooldown);
+
+    // Flamethrower hold state → server + looping sound. holdPrev/squeezeStart give the FLAME_MAX_MS
+    // cap a "release and press again to refill" feel: while the budget's spent the button stays
+    // held but we report not-flaming, and only a fresh press (rising edge) resets the timer.
+    const selfNow = room.state.voles.get(room.sessionId) as { alive: boolean } | undefined;
+    const holdingFlame =
+      weaponSelector.selectedId === "flamethrower" && input.isFireHeld() && !!selfNow && selfNow.alive;
+    if (holdingFlame && !flameHoldPrev) flameSqueezeStart = performance.now();
+    flameHoldPrev = holdingFlame;
+    const wantFlaming = holdingFlame && performance.now() - flameSqueezeStart < FLAME_MAX_MS;
+    if (wantFlaming !== localFlaming) {
+      localFlaming = wantFlaming;
+      sendFlame(room, wantFlaming);
+      if (wantFlaming) startFlameLoop();
+      else stopFlameLoop();
+    }
+
+    // Grenade: hold LMB to charge a longer throw, release to throw. Rising edge (with the weapon off
+    // cooldown) starts the charge; while charging, draw the predicted throw arc; on release throw
+    // with the built-up 0..1 power. Dying or switching weapon mid-charge just cancels it.
+    const grenadeAlive = !!selfNow && selfNow.alive;
+    const holdingGrenade = weaponSelector.selectedId === "grenade" && grenadeAlive && input.isFireHeld();
+    if (holdingGrenade && !grenadeHoldPrev) {
+      const lastGren = lastFireAt.get("grenade") ?? -Infinity;
+      if (time - lastGren >= (WEAPONS.grenade.fireCooldown ?? 0)) {
+        grenadeCharging = true;
+        grenadeChargeStart = performance.now();
+        playGrenadeSokka(); // "pin pull" as the charge starts
+      }
+    }
+    grenadeHoldPrev = holdingGrenade;
+
+    if (grenadeCharging) {
+      const power = Math.max(0, Math.min(1, (performance.now() - grenadeChargeStart) / GRENADE_CHARGE_MS));
+      const stillCharging = weaponSelector.selectedId === "grenade" && grenadeAlive && input.isFireHeld();
+      const selfView = voleViews.get(room.sessionId);
+      if (stillCharging && selfView) {
+        grenadeGuide.bringToFront(world);
+        grenadeGuide.show(selfView.renderX, selfView.renderY, playerInput.aimAngle, power, terrain);
+      } else {
+        grenadeCharging = false;
+        grenadeGuide.hide();
+        // Throw only on a genuine release (still alive, grenade still selected, button now up).
+        if (weaponSelector.selectedId === "grenade" && grenadeAlive && !input.isFireHeld()) {
+          lastFireAt.set("grenade", time);
+          sendFire(room, "grenade", power);
+          playGrenadeThrow();
+        }
+      }
     }
 
     room.state.voles.forEach(
@@ -559,21 +875,50 @@ async function main(): Promise<void> {
     });
     bulletLayer.update(dt, entityScale, bulletVoles);
     particleLayer.update(dt, entityScale);
+    bloodRenderer.update(dt);
+
+    // Flame streams (per flaming vole) + burn-patch decals — cosmetic; damage is the server's.
+    const flamingVoles: FlamingVole[] = [];
+    room.state.voles.forEach((vole: { x: number; y: number; aimAngle: number; alive: boolean; flaming: boolean }, sessionId: string) => {
+      if (!vole.alive || !vole.flaming) return;
+      const v = voleViews.get(sessionId);
+      flamingVoles.push({
+        id: sessionId,
+        x: v ? v.renderX : vole.x,
+        y: v ? v.renderY : vole.y,
+        aimAngle: v ? v.renderAngle : vole.aimAngle,
+      });
+    });
+    // Show the local player's own stream the instant they fire, without waiting for the server's
+    // `flaming` flag to round-trip back.
+    if (localFlaming && !flamingVoles.some((f) => f.id === room.sessionId)) {
+      const v = voleViews.get(room.sessionId);
+      if (v) flamingVoles.push({ id: room.sessionId, x: v.renderX, y: v.renderY, aimAngle: v.renderAngle });
+    }
+    const burnMarkers: BurnMarker[] = [];
+    room.state.burns.forEach((burn: { id: string; x: number; y: number }) => {
+      burnMarkers.push({ id: burn.id, x: burn.x, y: burn.y });
+    });
+    flameLayer.update(time, flamingVoles, burnMarkers);
+    damageNumbers.update(dt);
 
     const corpsePosEase = easeFactor(POSITION_SMOOTH_RATE, dt);
-    room.state.corpses.forEach((corpse: { x: number; y: number; facing: number }, id: string) => {
+    room.state.corpses.forEach((corpse: { x: number; y: number; facing: number; angle: number }, id: string) => {
       const view = corpseViews.get(id);
       if (!view) return;
       view.renderX += (corpse.x - view.renderX) * corpsePosEase;
       view.renderY += (corpse.y - view.renderY) * corpsePosEase;
-      view.graphic.position.set(view.renderX, view.renderY);
-      view.graphic.scale.set(entityScale * corpse.facing, entityScale);
+      view.renderAngle += shortestAngleDelta(view.renderAngle, corpse.angle) * easeFactor(ANGLE_SMOOTH_RATE, dt);
+      view.container.position.set(view.renderX, view.renderY);
+      view.container.rotation = view.renderAngle;
+      view.container.scale.set(entityScale * corpse.facing, entityScale);
     });
 
     // Depends on this frame's renderVole pass above (uses the local player's just-updated smoothed
     // render position as the zoom focus point), so it has to run after that loop, every frame — not
-    // just on resize — since the focus point moves continuously.
-    applyCamera();
+    // just on resize — since the focus point moves continuously. Passing dt here is what drives the
+    // renderZoom easing inside applyCamera.
+    applyCamera(dt);
 
     const self = room.state.voles.get(room.sessionId);
     if (self) {

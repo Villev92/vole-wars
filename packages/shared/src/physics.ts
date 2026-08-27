@@ -1,4 +1,4 @@
-import { TerrainField } from "./terrain.js";
+import { TERRAIN_ROCK, TerrainField } from "./terrain.js";
 import type { WeaponDef } from "./weapons.js";
 import type { CorpseSimState, DamageEvent, PlayerInput, ProjectileSimState, VoleSimState } from "./types.js";
 
@@ -11,15 +11,33 @@ export const GRAVITY = 900; // px/s^2
 // changes: a mismatch here reappears as the character floating above (or sinking into) the ground.
 export const VOLE_RADIUS = 3.5;
 export const MOVE_SPEED = 50; // px/s
-// Peak jump height is JUMP_SPEED^2 / (2*GRAVITY), so it scales with the *square* of this — to cut
-// height to 1/3 (was 280^2/(2*900) ≈ 43.6 units, now ≈ 14.5), speed is divided by sqrt(3), not 3.
-export const JUMP_SPEED = 161.7; // px/s
+// Peak jump height is JUMP_SPEED^2 / (2*GRAVITY), so it scales with the *square* of this. Raised
+// 161.7 -> 200 (was ≈14.5 units high/0.36s airtime, now ≈22.2 units/0.44s) for a punchier launch —
+// requested directly ("add jump speed") alongside the render-smoothing fix (see
+// LOCAL_POSITION_SMOOTH_RATE in main.ts) for a jump that visibly snaps off the ground instead of
+// feeling like it's still ramping up.
+export const JUMP_SPEED = 200; // px/s
 // Kept deliberately tiny — this isn't the anti-spam measure itself (jumpHeld's "must release and
 // press again" requirement below is), just a small safety margin on top of it so landing and
-// re-triggering within the same/next tick (e.g. from network jitter) can't slip through. Long enough
-// to matter (a couple of ticks at 30Hz) but short enough that a deliberate re-press right after
-// landing never feels eaten.
-const JUMP_COOLDOWN = 0.08; // seconds
+// re-triggering within the same/next tick (e.g. from network jitter) can't slip through. Shaved down
+// to ~1 tick at 30Hz (was 0.08, noticeably laggier) since jumpHeld's release-then-repress requirement
+// is what actually blocks bunnyhopping — this only needs to survive network jitter, not add its own
+// deliberate delay.
+const JUMP_COOLDOWN = 0.04; // seconds
+
+// "Coyote time": a jump press still counts as grounded for a brief window after the vole leaves the
+// ground with no jump input yet (walking off a ledge, or the single-tick grounded flicker that can
+// happen crossing an uneven/sloped cell boundary) — named for the cartoon physics of not falling
+// until you look down. Without this, a press that lands one tick after grounded flips false reads as
+// a missed jump even though the player was standing on solid ground a moment ago.
+const COYOTE_TIME = 0.1; // seconds
+// Jump input buffering: a press that arrives up to this long BEFORE touchdown still fires the jump
+// the instant landing (or coyote time) makes it valid, rather than being silently dropped for having
+// arrived one tick too early — the single biggest source of "jump feels unresponsive" complaints in
+// platformers, since a player pressing jump right before impact is a completely normal input, not a
+// timing mistake. Does not defeat the anti-bunnyhop rule: it only fires once per fresh press
+// (jumpHeld still requires a release before the next one), never on a press held through a landing.
+const JUMP_BUFFER_TIME = 0.12; // seconds
 
 // The server steps physics in fixed 1/30s increments. stepProjectile() only samples terrain at the
 // end of each step, so the step size affects exactly where a fast-moving projectile is judged to
@@ -185,8 +203,18 @@ export const ROPE_MAX_DISTANCE = 600;
 const ROPE_CAST_STEP = 1;
 // A rope shorter than this would let the vole clip past the anchor point itself.
 export const ROPE_MIN_LENGTH = 10;
-const ROPE_REEL_SPEED = 30; // px/s change to rope length while reeling in/out
-const ROPE_SWING_ACCEL = 340; // px/s^2 tangential thrust from the A/D swing pump
+// Below this distance, an attach attempt is left pending (see updateRopeAttachment) instead of
+// grabbing on immediately — cave terrain means the very first raycast tick often finds a wall just a
+// few units away (right next to whatever the player happened to be standing near), which used to grab
+// on instantly and leave them stuck pendulum-swinging in a tiny arc against that wall instead of the
+// actual distant point they were aiming for. Recasting every held tick (already the existing
+// behavior) means holding the button and sweeping the aim past a too-close wall just keeps trying
+// until it reaches something far enough away to be a real anchor.
+const ROPE_MIN_ATTACH_DISTANCE = 24;
+const ROPE_REEL_SPEED = 42; // px/s change to rope length while reeling in/out
+// Tangential thrust from the A/D swing pump — raised from 340 (was sluggish enough that fighting
+// gravity/momentum to actually redirect a swing felt like it barely responded to input at all).
+const ROPE_SWING_ACCEL = 560; // px/s^2
 
 /**
  * Walks a ray from (x, y) at `angle` in fixed steps, returning the first solid terrain cell it
@@ -237,6 +265,7 @@ function updateRopeAttachment(vole: VoleSimState, input: PlayerInput, terrain: T
 
   const hit = raycastTerrain(terrain, vole.x, vole.y, vole.aimAngle, ROPE_MAX_DISTANCE);
   if (!hit) return;
+  if (Math.hypot(hit.x - vole.x, hit.y - vole.y) < ROPE_MIN_ATTACH_DISTANCE) return;
 
   vole.ropeActive = true;
   vole.ropeAnchorX = hit.x;
@@ -355,14 +384,29 @@ export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: Terrai
   const wasGrounded = vole.grounded;
 
   vole.jumpCooldown = Math.max(0, vole.jumpCooldown - dt);
+  // Decayed from last tick's value before this tick's landing (below) potentially refreshes it —
+  // same "reflects state as of the end of the previous tick" timing as wasGrounded above.
+  vole.coyoteTimer = Math.max(0, vole.coyoteTimer - dt);
+  vole.jumpBufferTimer = Math.max(0, vole.jumpBufferTimer - dt);
+
   // Requires input.jump to have gone false at some point since the last jump — holding the button
   // down through a landing (jumpHeld stays true the whole time) does NOT re-trigger; the player has
-  // to actually release and press again.
+  // to actually release and press again. This is the actual anti-bunnyhop rule; buffering below only
+  // changes WHEN a fresh press is allowed to land, never whether repeated presses are required.
   if (!input.jump) vole.jumpHeld = false;
-  if (input.jump && wasGrounded && !vole.jumpHeld && vole.jumpCooldown <= 0) {
+  // A fresh press is "used up" immediately (jumpHeld = true) whether or not it can jump this instant
+  // — it either fires below (grounded/coyote) or gets parked in the buffer to fire on an imminent
+  // landing. Either way, holding through that landing must not re-trigger, so jumpHeld still flips
+  // the moment the press is registered, not only once a jump actually launches.
+  if (input.jump && !vole.jumpHeld) {
+    vole.jumpHeld = true;
+    vole.jumpBufferTimer = JUMP_BUFFER_TIME;
+  }
+  if ((wasGrounded || vole.coyoteTimer > 0) && vole.jumpBufferTimer > 0 && vole.jumpCooldown <= 0) {
     vole.vy = -JUMP_SPEED;
     vole.grounded = false;
-    vole.jumpHeld = true;
+    vole.jumpBufferTimer = 0;
+    vole.coyoteTimer = 0;
   }
 
   vole.vy += GRAVITY * dt;
@@ -410,6 +454,11 @@ export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: Terrai
   if (!wasGrounded && vole.grounded) {
     vole.jumpCooldown = JUMP_COOLDOWN;
   }
+  // Refresh every grounded tick (not just on the falling->grounded transition above) so coyote time
+  // always counts from the LAST tick the vole was actually standing on something, however that ended.
+  if (vole.grounded) {
+    vole.coyoteTimer = COYOTE_TIME;
+  }
 }
 
 // A dead vole's corpse reuses the living collision size (fits through the same passages the vole
@@ -422,10 +471,51 @@ const CORPSE_RADIUS = VOLE_RADIUS;
 // "the ground just under me is now gone" without re-running a full sweep for every resting corpse.
 const CORPSE_SUPPORT_PROBE = 1;
 
+// How far to each side of the corpse's own x to sample ground height for its rest tilt — roughly the
+// art's own length (see skeletonArt.ts) so the sampled slope reflects the ground actually under the
+// whole body, not just the point directly below its center.
+const CORPSE_SLOPE_SAMPLE_OFFSET = 4;
+// Vertical window (each way from the corpse's own y) searched for the topmost solid cell in a slope
+// sample column — wide enough to find the surface under a landed corpse even after it's sunk a
+// couple of units into a substep, narrow enough that it can't reach past a nearby cliff/overhang and
+// sample unrelated ground several body-lengths away.
+const CORPSE_SLOPE_SEARCH_RANGE = 12;
+// Caps how far off-horizontal the rest tilt can go, so a corpse landing right at the lip of a steep
+// or vertical drop reads as "resting near the edge" rather than pinned flat up a near-vertical face.
+const CORPSE_MAX_TILT = 0.9; // radians, ~52°
+
+/** Topmost solid cell in column x within CORPSE_SLOPE_SEARCH_RANGE of yCenter, or null if the whole
+ *  window is empty (e.g. sampling out past the edge of a ledge, over open air). */
+function findSurfaceY(terrain: TerrainField, x: number, yCenter: number): number | null {
+  const minY = Math.floor(yCenter - CORPSE_SLOPE_SEARCH_RANGE);
+  const maxY = Math.ceil(yCenter + CORPSE_SLOPE_SEARCH_RANGE);
+  for (let y = minY; y <= maxY; y++) {
+    if (terrain.isSolid(x, y)) return y;
+  }
+  return null;
+}
+
+/**
+ * Rest tilt for a corpse landing at (x, y): the angle between ground-surface samples a fixed offset
+ * to either side, so the body reads as lying flush along the actual slope underneath it instead of
+ * always flat — a corpse landing on a steep bank with only one edge actually touching down otherwise
+ * looks like it's floating above the rest of its own body. Falls back to 0 (flat) if either sample
+ * misses solid ground entirely (e.g. one side hangs off a ledge) rather than guessing.
+ */
+function computeRestAngle(terrain: TerrainField, x: number, y: number): number {
+  const leftY = findSurfaceY(terrain, x - CORPSE_SLOPE_SAMPLE_OFFSET, y);
+  const rightY = findSurfaceY(terrain, x + CORPSE_SLOPE_SAMPLE_OFFSET, y);
+  if (leftY === null || rightY === null) return 0;
+  const angle = Math.atan2(rightY - leftY, CORPSE_SLOPE_SAMPLE_OFFSET * 2);
+  return Math.max(-CORPSE_MAX_TILT, Math.min(CORPSE_MAX_TILT, angle));
+}
+
 /**
  * Vertical-only physics for a dead vole's skeleton: rests in place while supported, and starts
  * falling (reusing the same substepped sweepAxis as stepVole) the instant an explosion carves away
- * the ground underneath it, until it lands on whatever terrain (or the rock border) is now below.
+ * the ground underneath it, until it lands on whatever terrain (or the rock border) is now below —
+ * recomputing its rest tilt (see computeRestAngle) each time it lands, since the ground it settles on
+ * next is generally not the same shape as what it left.
  */
 export function stepCorpse(corpse: CorpseSimState, terrain: TerrainField, dt: number): void {
   if (corpse.grounded) {
@@ -439,6 +529,7 @@ export function stepCorpse(corpse: CorpseSimState, terrain: TerrainField, dt: nu
   if (moveY.blocked) {
     corpse.grounded = true;
     corpse.vy = 0;
+    corpse.angle = computeRestAngle(terrain, corpse.x, corpse.y);
   }
 }
 
@@ -469,10 +560,16 @@ const BODY_HIT_RADIUS = VOLE_RADIUS;
 // full VoleSimState just for this.
 export type VoleHitTarget = Pick<VoleSimState, "id" | "x" | "y" | "alive">;
 
-/** Checked once per sampled point along a projectile's step, same idea as circleHitsTerrain. */
-function findVoleHit(voles: VoleHitTarget[], x: number, y: number): VoleHit | null {
+// A just-fired projectile spawns near its owner (see GameRoom.handleFire) — ignore hits on that
+// owner until it has flown this far, so it can't detonate on the shooter's own head/body coming out
+// of the barrel. Comfortably clears BODY_HIT_RADIUS + the head zone above it, plus margin.
+export const PROJECTILE_OWNER_CLEARANCE = 9;
+
+/** Checked once per sampled point along a projectile's step, same idea as circleHitsTerrain.
+ *  `ignoreVoleId` (the still-close shooter, early in the projectile's life) is skipped. */
+function findVoleHit(voles: VoleHitTarget[], x: number, y: number, ignoreVoleId?: string): VoleHit | null {
   for (const vole of voles) {
-    if (!vole.alive) continue;
+    if (!vole.alive || vole.id === ignoreVoleId) continue;
     const hdx = x - vole.x;
     const hdy = y - (vole.y + HEAD_CENTER_Y_OFFSET);
     if (hdx * hdx + hdy * hdy <= HEAD_HIT_RADIUS * HEAD_HIT_RADIUS) {
@@ -493,6 +590,36 @@ export interface ProjectileStepResult {
   y: number;
   /** Set when `exploded` resolved from hitting a vole directly, rather than terrain/bounds. */
   hit: VoleHit | null;
+  /** Distance (within this call's traveled segment) actually spent inside solid dirt/stone while a
+   *  piercing weapon flew through it without exploding — 0 for a non-piercing weapon or whenever no
+   *  solid material was in the way. Lets the caller track "how much terrain has this projectile
+   *  actually destroyed" (see WeaponDef.pierceTerrainLimit) separately from total distance flown,
+   *  which counts open-air travel too. */
+  pierceDistance: number;
+}
+
+/**
+ * Rough outward surface normal at a solid-terrain point: sum the directions to every solid cell in a
+ * small neighbourhood (weighted by 1/distance) and point away from that. Falls back to straight up
+ * (a floor) when there's no gradient to read. Used by stepProjectile to bounce grenades — good
+ * enough to kick off floors, walls and slopes believably, not a precise contact solver.
+ */
+export function terrainNormal(terrain: TerrainField, x: number, y: number): { x: number; y: number } {
+  let sx = 0;
+  let sy = 0;
+  const radius = 3;
+  for (let oy = -radius; oy <= radius; oy++) {
+    for (let ox = -radius; ox <= radius; ox++) {
+      if (ox === 0 && oy === 0) continue;
+      if (!terrain.isSolid(x + ox, y + oy)) continue;
+      const d = Math.hypot(ox, oy);
+      sx += ox / d;
+      sy += oy / d;
+    }
+  }
+  const len = Math.hypot(sx, sy);
+  if (len < 1e-4) return { x: 0, y: -1 };
+  return { x: -sx / len, y: -sy / len };
 }
 
 export function stepProjectile(
@@ -500,7 +627,17 @@ export function stepProjectile(
   weapon: WeaponDef,
   terrain: TerrainField,
   dt: number,
-  voles: VoleHitTarget[] = []
+  voles: VoleHitTarget[] = [],
+  // Remaining terrain-piercing budget (see WeaponDef.pierceTerrainLimit) for THIS call only — once
+  // the solid material sampled within this single step would exceed it, stop right there instead of
+  // finishing the step, so the cutoff isn't just tick-granular the way pierceRange's is. Irrelevant
+  // for a non-piercing weapon; defaults to unlimited so existing callers that never pass it (or a
+  // piercing weapon with no configured limit) behave as before.
+  pierceBudget: number = Infinity,
+  // The shooter, while the projectile is still within PROJECTILE_OWNER_CLEARANCE of the barrel — hits
+  // on this vole are ignored so a shot fired point-blank into a wall you're hugging carves the wall
+  // instead of detonating on your own head. The caller passes it only for that early window.
+  ignoreVoleId?: string
 ): ProjectileStepResult {
   proj.vy += GRAVITY * weapon.gravityScale * dt;
   const nextX = proj.x + proj.vx * dt;
@@ -515,22 +652,55 @@ export function stepProjectile(
   const dy = nextY - proj.y;
   const segmentLength = Math.hypot(dx, dy);
   const sampleCount = Math.max(1, Math.ceil(segmentLength / 0.5));
+  const sampleStep = segmentLength / sampleCount;
+  let pierceDistance = 0;
   for (let i = 1; i <= sampleCount; i++) {
     const t = i / sampleCount;
     const x = proj.x + dx * t;
     const y = proj.y + dy * t;
-    const hit = findVoleHit(voles, x, y);
+    const hit = findVoleHit(voles, x, y, ignoreVoleId);
     if (hit) {
-      return { exploded: true, x, y, hit };
+      return { exploded: true, x, y, hit, pierceDistance };
     }
     if (terrain.isSolid(x, y)) {
-      return { exploded: true, x, y, hit: null };
+      // A bouncing weapon (grenade — see WeaponDef.bounces) rides out its first `bounces` terrain
+      // contacts and detonates on the next. Reflect off an estimated surface normal, pull back to
+      // just before contact, and end the step there; the leftover motion resumes next tick with the
+      // new velocity. A vole hit above still detonates it regardless of bounce count.
+      if (weapon.bounces !== undefined) {
+        if ((proj.bounces ?? 0) >= weapon.bounces) {
+          return { exploded: true, x, y, hit: null, pierceDistance };
+        }
+        const n = terrainNormal(terrain, x, y);
+        const clearT = (i - 1) / sampleCount;
+        const bx = proj.x + dx * clearT;
+        const by = proj.y + dy * clearT;
+        const vDotN = proj.vx * n.x + proj.vy * n.y;
+        const restitution = weapon.bounceRestitution ?? 0.5;
+        proj.vx = (proj.vx - 2 * vDotN * n.x) * restitution;
+        proj.vy = (proj.vy - 2 * vDotN * n.y) * restitution;
+        proj.x = bx + n.x * 0.75;
+        proj.y = by + n.y * 0.75;
+        proj.bounces = (proj.bounces ?? 0) + 1;
+        return { exploded: false, x: proj.x, y: proj.y, hit: null, pierceDistance };
+      }
+      // A piercing weapon (sniper — see WeaponDef.piercing) only stops on indestructible rock or
+      // running out of pierceBudget; dirt/stone otherwise don't block it here — the caller
+      // (GameRoom.update) is what actually carves that material away as it flies through, tick by
+      // tick, rather than this function stopping at the first solid cell like every other weapon.
+      if (!weapon.piercing || terrain.get(Math.floor(x), Math.floor(y)) === TERRAIN_ROCK) {
+        return { exploded: true, x, y, hit: null, pierceDistance };
+      }
+      pierceDistance += sampleStep;
+      if (pierceDistance >= pierceBudget) {
+        return { exploded: true, x, y, hit: null, pierceDistance };
+      }
     }
   }
 
   proj.x = nextX;
   proj.y = nextY;
-  return { exploded: false, x: nextX, y: nextY, hit: null };
+  return { exploded: false, x: nextX, y: nextY, hit: null, pierceDistance };
 }
 
 export interface ExplosionResult {
@@ -538,13 +708,13 @@ export interface ExplosionResult {
   damageEvents: DamageEvent[];
 }
 
-// Flat per-hit damage values (not yet weapon-specific — every weapon uses the same numbers for now
-// and gets tuned individually later). A direct hit replaces the old distance-falloff damage outright
-// for the vole actually struck; anyone else merely caught in the blast radius takes a flat, much
-// smaller amount regardless of how close they were.
-const DIRECT_HIT_BODY_DAMAGE = 5;
-const DIRECT_HIT_HEAD_DAMAGE = 10;
-const SPLASH_ONLY_DAMAGE = 2;
+// A direct hit deals the weapon's own damage (headshots multiplied by headshotMultiplier, default
+// 2x — see WeaponDef) to the vole actually struck. Anyone else merely caught in the blast radius
+// takes weapon.splashDamage (or this small flat default) regardless of how close they were — UNLESS
+// the weapon sets linearFalloff (grenade), in which case splash scales linearly from the full
+// `damage` at the centre down to 0 at explosionRadius, rounded to the nearest integer.
+const DEFAULT_HEADSHOT_MULTIPLIER = 2;
+const DEFAULT_SPLASH_DAMAGE = 2;
 
 export function applyExplosion(
   terrain: TerrainField,
@@ -568,12 +738,17 @@ export function applyExplosion(
     const falloff = dist > 0.001 ? Math.min(1, 1 - dist / weapon.explosionRadius) : 1;
     const amount = isDirectTarget
       ? directHit!.part === "head"
-        ? DIRECT_HIT_HEAD_DAMAGE
-        : DIRECT_HIT_BODY_DAMAGE
-      : SPLASH_ONLY_DAMAGE;
+        ? weapon.damage * (weapon.headshotMultiplier ?? DEFAULT_HEADSHOT_MULTIPLIER)
+        : weapon.damage
+      : weapon.linearFalloff
+        ? Math.round(weapon.damage * Math.max(0, falloff))
+        : weapon.splashDamage ?? DEFAULT_SPLASH_DAMAGE;
     const knockback = 260 * Math.max(falloff, 0);
     const nx = dist > 0.001 ? dx / dist : 0;
     const ny = dist > 0.001 ? dy / dist : -1;
+
+    // Right at the blast edge a linear-falloff weapon does 0 — no blood/knockback event for it.
+    if (!isDirectTarget && amount <= 0) continue;
 
     vole.vx += nx * knockback;
     vole.vy += ny * knockback;

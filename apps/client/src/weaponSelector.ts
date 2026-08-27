@@ -3,8 +3,16 @@ import { WEAPON_IDS, WEAPON_LABELS, type TexturedWeaponId, type WeaponId } from 
 
 const BOX_SIZE = 84;
 const BOX_GAP = 8;
-const ICON_PADDING = 8; // screen px of margin kept between the icon and the box edge
+const ICON_PADDING = 4; // screen px of margin kept between the icon and the box edge (was 8 — icons read small)
 const BOTTOM_MARGIN = 16; // screen px between the bar and the bottom of the window
+
+// Per-weapon size multiplier applied on top of the fit-to-box scale. grenade and mine are drawn as
+// small centred objects (not a full-width gun) with a lot of empty canvas around them, so they came
+// out noticeably tinier than the rifles even at the same box fit — bump them up to match.
+const ICON_BOOST: Partial<Record<WeaponId, number>> = {
+  grenade: 1.3,
+  mine: 1.3,
+};
 
 // Was near-black (0x101418, matching the page background) — indistinguishable from the icons' own
 // dark ink outlines and shadowed metal tones, so weapons read as floating fragments rather than
@@ -24,7 +32,7 @@ const HIGHLIGHT_COLOR = 0x8fe38f; // matches the FPS counter / respawn button's 
 // showing the currently selected weapon much bigger than a 64px slot can, since the slot icons are
 // still small enough at a glance to be hard to tell apart.
 const PREVIEW_SIZE = 128;
-const PREVIEW_ICON_PADDING = 20;
+const PREVIEW_ICON_PADDING = 14;
 const PREVIEW_LEFT_MARGIN = 20;
 const PREVIEW_LABEL_MARGIN = 10; // gap kept between the icon and the label above the bottom edge
 
@@ -33,10 +41,11 @@ interface Slot {
   bg: Graphics;
 }
 
-/** Scales+centers a Sprite to fit (preserving aspect ratio) within a boxSize x boxSize square. */
-function fitSpriteInBox(sprite: Sprite, boxSize: number, padding: number): void {
+/** Scales+centers a Sprite to fit (preserving aspect ratio) within a boxSize x boxSize square,
+ *  times an optional `boost` (>1 lets a small-content icon overflow the padding to read larger). */
+function fitSpriteInBox(sprite: Sprite, boxSize: number, padding: number, boost = 1): void {
   const available = boxSize - padding * 2;
-  const scale = Math.min(available / sprite.texture.width, available / sprite.texture.height);
+  const scale = Math.min(available / sprite.texture.width, available / sprite.texture.height) * boost;
   sprite.anchor.set(0.5, 0.5);
   sprite.scale.set(scale);
   sprite.position.set(boxSize / 2, boxSize / 2);
@@ -53,9 +62,18 @@ export class WeaponSelector {
   private readonly slots: Slot[] = [];
   private readonly previewBg: Graphics;
   private readonly previewIconSprite: Sprite;
+  private readonly cooldownOverlay: Graphics;
   private readonly previewLabel: Text;
   private readonly iconTextures: Record<TexturedWeaponId, Texture>;
   private selectedIndex = 0;
+
+  /**
+   * Called when a slot is chosen by *clicking* it (not by key or scroll). The same click also lands
+   * on the game canvas underneath as a left-press, which would otherwise fire the weapon — main.ts
+   * hooks this to swallow that one canvas press. A slot's Pixi pointerdown runs before the canvas's
+   * DOM mousedown (pointer events precede mouse events), so the flag is set in time.
+   */
+  onSlotPointerDown: (() => void) | null = null;
 
   constructor(iconTextures: Record<TexturedWeaponId, Texture>) {
     this.iconTextures = iconTextures;
@@ -66,6 +84,10 @@ export class WeaponSelector {
     this.preview.addChild(this.previewBg);
     this.previewIconSprite = new Sprite();
     this.preview.addChild(this.previewIconSprite);
+    // Round "on cooldown" wipe drawn over the preview icon — see setCooldown/drawCooldown. Sits
+    // above the icon but below the label so the weapon name stays legible while it's up.
+    this.cooldownOverlay = new Graphics();
+    this.preview.addChild(this.cooldownOverlay);
     this.previewLabel = new Text({
       text: "",
       style: { fill: 0xd7e0e8, fontFamily: "monospace", fontSize: 13, fontWeight: "600" },
@@ -82,7 +104,7 @@ export class WeaponSelector {
       root.addChild(bg);
 
       const sprite = new Sprite(this.iconTextures[id]);
-      fitSpriteInBox(sprite, BOX_SIZE, ICON_PADDING);
+      fitSpriteInBox(sprite, BOX_SIZE, ICON_PADDING, ICON_BOOST[id] ?? 1);
       root.addChild(sprite);
 
       const keyLabel = new Text({
@@ -94,7 +116,10 @@ export class WeaponSelector {
 
       root.eventMode = "static";
       root.cursor = "pointer";
-      root.on("pointerdown", () => this.setSelected(index));
+      root.on("pointerdown", () => {
+        this.onSlotPointerDown?.();
+        this.setSelected(index);
+      });
 
       this.container.addChild(root);
       this.slots.push({ root, bg });
@@ -120,9 +145,35 @@ export class WeaponSelector {
     this.previewBg.roundRect(0, 0, PREVIEW_SIZE, PREVIEW_SIZE, 10).stroke({ width: 2, color: HIGHLIGHT_COLOR });
 
     this.previewIconSprite.texture = this.iconTextures[this.selectedId];
-    fitSpriteInBox(this.previewIconSprite, PREVIEW_SIZE, PREVIEW_ICON_PADDING);
+    fitSpriteInBox(this.previewIconSprite, PREVIEW_SIZE, PREVIEW_ICON_PADDING, ICON_BOOST[this.selectedId] ?? 1);
 
     this.previewLabel.text = this.selectedLabel;
+  }
+
+  /**
+   * Draws (or clears) a round cooldown wipe over the preview icon — `ratio` is the fraction of the
+   * currently selected weapon's fireCooldown still remaining, 1 right after firing down to 0 once
+   * it's fireable again. Most noticeable on slow weapons (sniper, bazooka) where the wait is long
+   * enough to actually see; on fast ones it just flickers, which is correct — there's really nothing
+   * to wait for. Redrawn every frame from main.ts's ticker, driven by its own client-side prediction
+   * of the same fireCooldown the server enforces (see main.ts's lastFireAt).
+   */
+  setCooldown(ratio: number): void {
+    const clamped = Math.max(0, Math.min(1, ratio));
+    this.cooldownOverlay.clear();
+    if (clamped <= 0) return;
+
+    const cx = PREVIEW_SIZE / 2;
+    const cy = PREVIEW_SIZE / 2;
+    const r = PREVIEW_SIZE / 2 - 3;
+    const start = -Math.PI / 2;
+    const end = start + clamped * Math.PI * 2;
+    // Dark pie wedge sweeping clockwise from the top, shrinking away as the cooldown finishes —
+    // the same "clock wipe" every ability-cooldown icon uses.
+    this.cooldownOverlay.moveTo(cx, cy).arc(cx, cy, r, start, end).lineTo(cx, cy).fill({ color: 0x0a0a0a, alpha: 0.62 });
+    // Ring traces the full circle so "not fireable yet" reads clearly even at a glance, before the
+    // wedge shape itself registers.
+    this.cooldownOverlay.circle(cx, cy, r).stroke({ width: 1.5, color: HIGHLIGHT_COLOR, alpha: 0.5 });
   }
 
   setSelected(index: number): void {

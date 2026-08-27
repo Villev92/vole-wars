@@ -12,8 +12,16 @@ export function sendInput(room: Room, input: PlayerInput): void {
   room.send("input", input);
 }
 
-export function sendFire(room: Room, weaponId: string): void {
-  room.send("fire", { weaponId });
+/** `power` (0..1) is only meaningful for charge-thrown weapons (grenade) — the server maps it to a
+ *  launch speed; omit it for every other weapon. */
+export function sendFire(room: Room, weaponId: string, power?: number): void {
+  room.send("fire", power === undefined ? { weaponId } : { weaponId, power });
+}
+
+/** Flamethrower hold state — sent on every change of "am I holding fire with the flamethrower out"
+ *  (see GameRoom's `flame` handler). Not a per-shot message; the server runs the stream while true. */
+export function sendFlame(room: Room, active: boolean): void {
+  room.send("flame", { active });
 }
 
 export interface TerrainInitMessage {
