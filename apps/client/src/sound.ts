@@ -53,8 +53,11 @@ export function unlockAudio(): void {
 // Every recorded sample used in the game — preloaded on the first gesture (unlockAudio) so the
 // first play of each has no fetch+decode latency. The flamethrower's is by far the biggest (~900KB).
 const FLAME_URL = "/audio/flamethrower.mp3";
+const MINIGUN_URL = "/audio/minigun.mp3";
+const BURROW_SWIRL_URL = "/audio/burrow-swirl.wav";
 const PRELOAD_URLS = [
   FLAME_URL,
+  MINIGUN_URL,
   "/audio/ak47.wav",
   "/audio/sniper.mp3",
   "/audio/bazooka-fire.wav",
@@ -65,15 +68,23 @@ const PRELOAD_URLS = [
   "/audio/grenade-throw.wav",
   "/audio/grenade-bounce.wav",
   "/audio/grenade-explosion.mp3",
+  "/audio/railgun.mp3",
+  "/audio/laserfire.mp3",
+  "/audio/shotgun-shoot.mp3",
+  "/audio/shotgun-reload.mp3",
+  "/audio/dash.mp3",
+  "/audio/burrow-swirl.wav",
 ];
 
 /** Kicks off (and caches) the fetch+decode of every recorded sample, and — once decoded — spins up
- *  the (silent) looping flamethrower node so the first squeeze is instant. Idempotent; needs an
- *  AudioContext so only call it from a user gesture. */
+ *  the (silent) looping held-fire nodes (flamethrower, minigun) so their first squeeze is instant.
+ *  Idempotent; needs an AudioContext so only call it from a user gesture. */
 export function preloadSamples(): void {
   getContext();
   for (const url of PRELOAD_URLS) void loadSample(url);
-  void loadSample(FLAME_URL).then(() => ensureFlameNode());
+  void loadSample(FLAME_URL).then(() => flameLoop.ensure());
+  void loadSample(MINIGUN_URL).then(() => minigunLoop.ensure());
+  void loadSample(BURROW_SWIRL_URL).then(() => burrowSwirlLoop.ensure());
 }
 
 /** Sets master volume (0-1) and remembers it for next time — dragging the slider is itself a user
@@ -141,69 +152,223 @@ export function playSniperShot(): void {
   playSample("/audio/sniper.mp3");
 }
 
+/** Dash superpower — the whoosh played on every dash (see main.ts's "dash" handler). */
+export function playDash(): void {
+  playSample("/audio/dash.mp3");
+}
+
+// The railgun's charge-up and its beam each have a recorded clip longer than the shortest possible
+// charge / beam, so — unlike fire-and-forget playSample — each is held on a stoppable source + gain
+// and cut (with a 0.03 s fade so there's no click) the instant its on-screen cause ends. main.ts
+// drives them from "is anyone charging" / "is any beam visible".
+function makeGatedSound(url: string): { start(): void; stop(immediate?: boolean): void } {
+  let source: AudioBufferSourceNode | null = null;
+  let gain: GainNode | null = null;
+  // "Should this be playing right now?" — so a start() that had to wait on the sample decoding
+  // (first use, before preload finishes) still fires once it's ready, but a start()+stop() before
+  // then resolves to silence.
+  let wanted = false;
+
+  const stop = (immediate = false): void => {
+    wanted = false;
+    const src = source;
+    const g = gain;
+    source = null;
+    gain = null;
+    if (!src) return;
+    if (immediate || !g) {
+      try {
+        src.stop();
+      } catch {
+        /* already stopped */
+      }
+      src.disconnect();
+      g?.disconnect();
+      return;
+    }
+    const now = getContext().currentTime;
+    g.gain.setTargetAtTime(0, now, 0.03);
+    try {
+      src.stop(now + 0.12);
+    } catch {
+      /* already stopped */
+    }
+    window.setTimeout(() => {
+      src.disconnect();
+      g.disconnect();
+    }, 250);
+  };
+
+  const start = (): void => {
+    wanted = true;
+    const audio = getContext();
+    if (audio.state === "suspended") void audio.resume();
+    const buffer = decodedBuffers.get(url);
+    if (!buffer) {
+      // Not decoded yet (first use, before preload finished) — decode, then play if still wanted.
+      void loadSample(url).then(() => {
+        if (wanted && !source) start();
+      });
+      return;
+    }
+    stop(true);
+    wanted = true; // stop() cleared it
+    gain = audio.createGain();
+    gain.gain.value = 1;
+    gain.connect(getMasterGain());
+    source = audio.createBufferSource();
+    source.buffer = buffer;
+    source.connect(gain);
+    source.start();
+  };
+
+  return { start, stop };
+}
+
+const railgunChargeSound = makeGatedSound("/audio/railgun.mp3");
+const railgunFireSound = makeGatedSound("/audio/laserfire.mp3");
+
+/** Railgun charge-up — plays while the trigger is held to charge (any player). */
+export function startRailgunChargeSound(): void {
+  railgunChargeSound.start();
+}
+export function stopRailgunChargeSound(immediate = false): void {
+  railgunChargeSound.stop(immediate);
+}
+/** Railgun beam — plays for as long as a fired beam is visible, cut the instant it ends. */
+export function startRailgunFireSound(): void {
+  railgunFireSound.start();
+}
+export function stopRailgunFireSound(immediate = false): void {
+  railgunFireSound.stop(immediate);
+}
+
 export function playBazookaFire(): void {
   playSample("/audio/bazooka-fire.wav");
 }
 
-// The flamethrower fires continuously while held. Rather than start/stop a BufferSource per squeeze
-// (which raced its own async load and dropped very short taps entirely), one looping source runs
-// forever once the sample's decoded and a dedicated GainNode gates it: start ramps the gain to 1,
-// stop ramps it back to 0. Gain changes are sample-accurate and synchronous, so the sound responds
-// instantly, and FLAME_MIN_BLIP guarantees even an instant tap produces an audible puff.
-const FLAME_ATTACK = 0.012; // gain ramp-up time constant (s)
-const FLAME_RELEASE = 0.05; // gain ramp-down time constant (s)
-const FLAME_MIN_BLIP = 0.12; // shortest audible burst, even for a 0ms tap
-let flameWanted = false;
-let flameSource: AudioBufferSourceNode | null = null;
-let flameGain: GainNode | null = null;
-let flameStartedAt = 0;
-
-/** Creates and starts the (silent) looping flamethrower source+gain if the sample is decoded and it
- *  isn't already running. Returns whether the node now exists. */
-function ensureFlameNode(): boolean {
-  if (flameSource) return true;
-  const buffer = decodedBuffers.get(FLAME_URL);
-  if (!buffer) return false;
-  const audio = getContext();
-  const gain = audio.createGain();
-  gain.gain.value = 0;
-  gain.connect(getMasterGain());
-  const source = audio.createBufferSource();
-  source.buffer = buffer;
-  source.loop = true;
-  source.connect(gain);
-  source.start();
-  flameSource = source;
-  flameGain = gain;
-  return true;
+/** Shotgun: the bang on fire, and the pump-action reload that runs during the post-shot cooldown. */
+export function playShotgunShoot(): void {
+  playSample("/audio/shotgun-shoot.mp3");
+}
+export function playShotgunReload(): void {
+  playSample("/audio/shotgun-reload.mp3");
 }
 
-/** Opens the flamethrower gain (fire started). */
+// Held-fire weapons (flamethrower, minigun) play a recorded loop for as long as the trigger is down.
+// Rather than start/stop a BufferSource per squeeze (which raced its own async load and dropped very
+// short taps entirely), one looping source per weapon runs forever once its sample is decoded and a
+// dedicated GainNode gates it: start() ramps the gain to 1, stop() ramps it back to 0. Gain changes
+// are sample-accurate and synchronous, so the sound responds instantly, and `minBlip` guarantees
+// even a 0ms tap produces an audible burst.
+interface LoopSound {
+  /** Create the (silent) looping source+gain if the sample's decoded and it isn't already running.
+   *  Returns whether the node now exists. Called eagerly from preloadSamples so start() is instant. */
+  ensure(): boolean;
+  /** Open the gain — trigger pressed. Pass `offsetSeconds` to tear down the running source and
+   *  (re)begin playback that far into the clip — the minigun uses this to keep the barrel sound
+   *  lined up with its heat level (heat fraction × fire length). Omit to just resume where it is. */
+  start(offsetSeconds?: number): void;
+  /** Close the gain — trigger released, but never before `minBlip` so a quick tap still gets heard. */
+  stop(): void;
+}
+
+function makeLoopSound(
+  url: string,
+  opts: { attack: number; release: number; minBlip: number; volume?: number },
+): LoopSound {
+  const openGain = opts.volume ?? 1;
+  let wanted = false;
+  let source: AudioBufferSourceNode | null = null;
+  let gain: GainNode | null = null;
+  let startedAt = 0;
+
+  const ensure = (offsetSeconds = 0): boolean => {
+    if (source) return true;
+    const buffer = decodedBuffers.get(url);
+    if (!buffer) return false;
+    const audio = getContext();
+    if (!gain) {
+      gain = audio.createGain();
+      gain.gain.value = 0;
+      gain.connect(getMasterGain());
+    }
+    source = audio.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    source.connect(gain);
+    source.start(0, Math.max(0, offsetSeconds) % buffer.duration);
+    return true;
+  };
+
+  const start = (offsetSeconds?: number): void => {
+    wanted = true;
+    const audio = getContext();
+    if (audio.state === "suspended") void audio.resume();
+    if (offsetSeconds !== undefined && source) {
+      try {
+        source.stop();
+      } catch {
+        /* already stopped */
+      }
+      source.disconnect();
+      source = null; // ensure() rebuilds it starting at offsetSeconds
+    }
+    if (!ensure(offsetSeconds)) {
+      // Sample not decoded yet (fired before preload finished) — decode, then retry if still wanted.
+      void loadSample(url).then(() => {
+        if (wanted) start(offsetSeconds);
+      });
+      return;
+    }
+    const now = audio.currentTime;
+    startedAt = now;
+    gain!.gain.cancelScheduledValues(now);
+    gain!.gain.setTargetAtTime(openGain, now, opts.attack);
+  };
+
+  const stop = (): void => {
+    wanted = false;
+    if (!gain) return;
+    const now = getContext().currentTime;
+    const rampAt = Math.max(now, startedAt + opts.minBlip);
+    gain.gain.setTargetAtTime(0, rampAt, opts.release);
+  };
+
+  return { ensure, start, stop };
+}
+
+const flameLoop = makeLoopSound(FLAME_URL, { attack: 0.012, release: 0.05, minBlip: 0.12 });
+const minigunLoop = makeLoopSound(MINIGUN_URL, { attack: 0.008, release: 0.04, minBlip: 0.08, volume: 0.75 });
+// Burrow's whole animation is only ~1.2s, so a gated loop (rather than one-shot playSample) is what
+// makes an early cancel actually cut the sound instead of letting a longer clip play out past it.
+const burrowSwirlLoop = makeLoopSound(BURROW_SWIRL_URL, { attack: 0.015, release: 0.08, minBlip: 0.1 });
+
+/** Flamethrower stream loop — see main.ts's flamethrower hold handling. */
 export function startFlameLoop(): void {
-  flameWanted = true;
-  const audio = getContext();
-  if (audio.state === "suspended") void audio.resume();
-  if (!ensureFlameNode()) {
-    // Sample not decoded yet (a fire before preload finished) — decode, then retry if still wanted.
-    void loadSample(FLAME_URL).then(() => {
-      if (flameWanted) startFlameLoop();
-    });
-    return;
-  }
-  const now = audio.currentTime;
-  flameStartedAt = now;
-  flameGain!.gain.cancelScheduledValues(now);
-  flameGain!.gain.setTargetAtTime(1, now, FLAME_ATTACK);
+  flameLoop.start();
+}
+export function stopFlameLoop(): void {
+  flameLoop.stop();
 }
 
-/** Closes the flamethrower gain (fire released), but never before FLAME_MIN_BLIP has elapsed so a
- *  quick tap still gets heard. */
-export function stopFlameLoop(): void {
-  flameWanted = false;
-  if (!flameGain) return;
-  const now = getContext().currentTime;
-  const rampAt = Math.max(now, flameStartedAt + FLAME_MIN_BLIP);
-  flameGain.gain.setTargetAtTime(0, rampAt, FLAME_RELEASE);
+/** Minigun barrel loop — runs while the trigger is held on the minigun (see main.ts's overheat
+ *  block). `offsetSeconds` (re)starts the clip that far in; main.ts passes `heat × FIRE_SECONDS`
+ *  every time firing (re)starts so the recorded fire always matches the barrel's heat/colour. */
+export function startMinigunLoop(offsetSeconds = 0): void {
+  minigunLoop.start(offsetSeconds);
+}
+export function stopMinigunLoop(): void {
+  minigunLoop.stop();
+}
+
+/** Burrow superpower's swirling dig sound — plays for as long as vole.burrowActive is true (see
+ *  main.ts's ticker), cut immediately (well, over `release`) on early cancel or natural completion. */
+export function startBurrowSwirlSound(): void {
+  burrowSwirlLoop.start();
+}
+export function stopBurrowSwirlSound(): void {
+  burrowSwirlLoop.stop();
 }
 
 /** Bazooka's own recorded blast, played instead of the generic synthesized playTerrainImpact()

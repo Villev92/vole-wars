@@ -55,10 +55,15 @@ export interface WeaponDef {
    *  touches something. Whichever of this or pierceRange is hit first turns piercing off. Undefined
    *  means no separate terrain-distance cap (only sniper sets this). */
   pierceTerrainLimit?: number;
-  /** Projectiles spawned per "fire" — defaults to 1. >1 fans them out across spreadRadians (shotgun/minigun). */
+  /** Projectiles spawned per "fire" — defaults to 1. >1 fans them out across spreadRadians (shotgun). */
   pelletCount?: number;
-  /** Total random aim-angle jitter pellets are fanned across when pelletCount > 1. Unused otherwise. */
+  /** Random aim-angle jitter (radians, total spread) applied to every shot when set — fans a
+   *  multi-pellet volley (shotgun) or just scatters a rapid single-round stream slightly (minigun). */
   spreadRadians?: number;
+  /** Random offset (terrain units, ± this much) applied to each shot's spawn point PERPENDICULAR to
+   *  the aim direction — so a rapid stream (minigun) fires as a band a few units tall rather than
+   *  every round dead on the same line. Aim direction itself is unchanged (that's spreadRadians). */
+  spawnSpread?: number;
   /** Flamethrower only — it is NOT a projectile weapon. Held-fire continuous flame stream this many
    *  terrain units long (see GameRoom's flame handling): it doesn't carve terrain, terrain blocks
    *  it, hitting terrain lights a short-lived burn patch, and both direct contact and standing in a
@@ -66,6 +71,10 @@ export interface WeaponDef {
   flameRange?: number;
   /** Half-angle (radians) of the flamethrower's spray cone. */
   flameConeHalfRadians?: number;
+  /** Radius (terrain units) of a burn patch — the SAME number drives the client's ground-fire
+   *  visual footprint and the server's "is this vole standing in it" damage check, so the two can't
+   *  drift apart (see flame.ts / GameRoom BURN_CONTACT_RADIUS). */
+  burnRadius?: number;
   /** Times the projectile may bounce off dirt/stone before it detonates — on the (bounces+1)-th
    *  terrain contact it explodes. Undefined = detonates on the first contact like normal. A contact
    *  with a vole always detonates regardless of bounce count. See stepProjectile. */
@@ -82,11 +91,53 @@ export interface WeaponDef {
   chargeThrow?: boolean;
   minThrowSpeed?: number;
   maxThrowSpeed?: number;
+  /** Railgun only — NOT a projectile weapon. A hold-to-charge blue beam handled server-side (see
+   *  GameRoom.updateRailgun): hold LMB to charge (0..1 over railgunChargeMs), release to fire. The
+   *  charge fraction c scales everything linearly between the Min/Max pairs below — damage/second,
+   *  beam reach, half-width, and how fast it digs. TERRAIN BLOCKS the beam: it can only reach as far
+   *  as the first solid cell along the aim, and chews into dirt/stone at the front (radius
+   *  railgunDigMin..MaxRadius per carve tick) until it breaks through; rock is a permanent stop.
+   *  The beam damages any vole its (terrain-clipped) segment touches. Lifetime = c × railgunChargeMs,
+   *  clamped to [railgunMinBeamMs, railgunMaxBeamMs]. */
+  railgunChargeMs?: number;
+  railgunMaxBeamMs?: number;
+  railgunMinDps?: number;
+  railgunMaxDps?: number;
+  railgunMinRange?: number;
+  railgunMaxRange?: number;
+  railgunMinHalfWidth?: number;
+  railgunMaxHalfWidth?: number;
+  /** Floor on beam lifetime so an instant tap (c≈0) still flashes a short beam. */
+  railgunMinBeamMs?: number;
+  /** Radius of the terrain bite taken at the beam's front each carve tick — bigger = digs faster
+   *  and bores a wider tunnel. Scales linearly with charge between these two. */
+  railgunDigMinRadius?: number;
+  railgunDigMaxRadius?: number;
 }
 
 // ak47 is the baseline maxRange every other weapon's range is designed relative to (see each
 // weapon's own comment) — sniper is specifically pinned to exactly double it per design.
 const AK47_MAX_RANGE = 300;
+
+/* ─── WEAPON SHEET ────────────────────────────────────────────────────────────────────────────────
+ * Quick tuning reference. All distances are terrain units (= "metres" in design talk; ARENA_WIDTH
+ * ≈ 679). "Rate of fire" is derived from fireCooldown: rof ≈ 1 / fireCooldown shots per second
+ * (server-enforced per player in GameRoom.handleFire — click speed can't beat it). Edit the numbers
+ * in each WeaponDef below; this table is just the at-a-glance summary, keep it in sync by hand.
+ *
+ *  weapon        travel dist         fireCooldown   rof        damage (body / head)      blast: carve / falloff   notes
+ *  ────────────  ─────────────────   ────────────   ────────   ──────────────────────   ──────────────────────   ─────────────────────────────
+ *  ak47          300  (maxRange)      0.15 s         ~6.7 /s    40 / 80                  2.75 / 8.5               flat, no bullet drop
+ *  minigun       100  (maxRange)      0.05 s         ~20  /s    3  / 3  (no head bonus)  1.4  / 3                 HELD stream; spawnSpread 2.4, spread 0.05 rad
+ *  shotgun        70  (maxRange)      0.47 s         reload     5 / 5  (per pellet)       1.6  / 4                 9 round pellets from one point, 0.7 rad spread, reload/shot
+ *  bazooka       260  (maxRange)      1.1  s         ~0.9 /s    30 / — (+20 splash)      16   / 48                lobbed arc (gravityScale 0.6)
+ *  grenade       240  (maxRange)      1.0  s         ~1.0 /s    40 / 40  (linear falloff)15   / 44                HELD charge-throw (speed 22–180), 1 bounce
+ *  mine          —    (dropped)       1.2  s         ~0.8 /s    30 / —  (linear falloff) 12   / 30                arms after 5 s, 0.5 u proximity, shootable
+ *  missile       340  (maxRange)      1.3  s         ~0.8 /s    60 / 120                 14   / 40                lobbed arc (gravityScale 0.35)
+ *  sniper        600  (maxRange)      1.4  s         ~0.7 /s    50 / 50                  3.5  / 6                 piercing (≤200 u travel, ≤50 u terrain)
+ *  railgun       12–75  (by charge)   0.5  s         hold-fire  1–30 /s (by charge)      digs at the front       HELD 4s charge → blue beam (≤4s); terrain BLOCKS it, it bores through
+ *  flamethrower   28  (flameRange)    0    (held)    —          5 /0.5s direct, 3 /0.5s burn patch  — (no carve)  HELD stream, 10 s max per squeeze
+ * ───────────────────────────────────────────────────────────────────────────────────────────────── */
 
 export const WEAPONS: Record<string, WeaponDef> = {
   bazooka: {
@@ -140,9 +191,9 @@ export const WEAPONS: Record<string, WeaponDef> = {
     bounceRestitution: 0.5,
     chargeThrow: true,
     minThrowSpeed: 22,
-    // ~45 units of throw at a 45° aim (range scales with speed², so a 1.5x range is a ~1.22x speed
-    // bump — 120 -> 147).
-    maxThrowSpeed: 147,
+    // Range scales with speed², so each "1.5x the throw distance" ask is a ~1.22x speed bump:
+    // 120 -> 147 -> 180. A full charge at a 45° aim now covers ~67 units before the first bounce.
+    maxThrowSpeed: 180,
   },
   sniper: {
     id: "sniper",
@@ -177,16 +228,29 @@ export const WEAPONS: Record<string, WeaponDef> = {
   },
   railgun: {
     id: "railgun",
-    // Reads as an instant energy beam by simply outrunning anything else in the game (SIM_DT-scale
-    // travel time across the whole 480-wide arena) rather than true hitscan — moderate splash/damage,
-    // the opposite tradeoff from sniper (precision) or bazooka (big slow lob). No maxRange: a beam
-    // weapon should reach anywhere on the map, not fizzle partway.
-    projectileSpeed: 1300,
+    // Charge-beam — NOT a projectile weapon (see WeaponDef's railgun* fields + GameRoom.updateRailgun
+    // and the client's railgun.ts renderer). Hold LMB to charge over railgunChargeMs, release to fire
+    // a blue beam whose damage-per-second, reach, thickness, lifetime and dig speed all scale with
+    // the charge held. TERRAIN BLOCKS the beam — it reaches only to the first solid cell and chews a
+    // dig-radius bite out of the front each carve tick until it breaks through (rock is permanent).
+    // It damages any vole its terrain-clipped segment touches. Projectile fields below are unused.
+    projectileSpeed: 0,
     gravityScale: 0,
-    explosionRadius: 10,
-    carveRadius: 4,
-    damage: 55,
-    fireCooldown: 1.6,
+    explosionRadius: 0,
+    carveRadius: 0,
+    damage: 0,
+    fireCooldown: 0.5, // the multi-second charge is the real rate limiter
+    railgunChargeMs: 4000, // hold this long for full power (damage/reach/width/dig speed)
+    railgunMaxBeamMs: 4000, // ...and the beam itself never lasts longer than this
+    railgunMinDps: 1,
+    railgunMaxDps: 30,
+    railgunMinRange: 12,
+    railgunMaxRange: 75,
+    railgunMinHalfWidth: 0.35,
+    railgunMaxHalfWidth: 3, // a touch wider than minigun's spawnSpread band (±2.4)
+    railgunMinBeamMs: 120,
+    railgunDigMinRadius: 1, // ~13 u/s penetration at min charge (carve every RAIL_CARVE_TICK_S)
+    railgunDigMaxRadius: 4, // ~50 u/s at full charge
   },
   flamethrower: {
     id: "flamethrower",
@@ -206,50 +270,59 @@ export const WEAPONS: Record<string, WeaponDef> = {
     flameRange: 28,
     // Nearly parallel — the stream is a tight directional jet, not a spreading cone.
     flameConeHalfRadians: 0.096,
+    burnRadius: 4.5,
   },
   shotgun: {
     id: "shotgun",
-    // Classic buckshot spread: many fast, flat-flying pellets, each individually weak with a tiny
-    // blast — devastating at point-blank where most connect, but the wide spreadRadians means most
-    // miss entirely past close range (unlike flamethrower's short gravity-dropped arc).
-    projectileSpeed: 700,
+    // Buckshot: a cloud of round pellets leaving from a single muzzle point (so the pattern is tight
+    // at point-blank) that fan out with an angular spreadRadians — the further a pellet flies, the
+    // wider the pattern. Short range, each pellet weak; the gun reloads (fireCooldown) after every
+    // shot. All-pellets-from-one-point is handled in GameRoom.handleFire for pelletCount > 1.
+    projectileSpeed: 620,
     gravityScale: 0,
-    explosionRadius: 7,
-    carveRadius: 2.5,
-    damage: 12,
-    maxRange: 130,
-    fireCooldown: 0.6,
-    pelletCount: 7,
-    spreadRadians: 0.55,
+    explosionRadius: 4,
+    carveRadius: 1.6,
+    damage: 5,
+    headshotMultiplier: 1, // flat 5 per pellet, head or body
+    maxRange: 70,
+    fireCooldown: 0.47, // == ShotgunReload.wav length — "reload takes as long as the clip lasts"
+    pelletCount: 9,
+    spreadRadians: 0.7,
   },
   minigun: {
     id: "minigun",
-    // Also a per-"fire" burst (see flamethrower/shotgun), but a much tighter cone than shotgun's —
-    // reads as a rapid stream of bullets landing in roughly the same spot rather than a spread.
-    projectileSpeed: 750,
+    // Held-fire rapid stream: while LMB is down the client re-sends "fire" every fireCooldown (see
+    // main.ts's ticker) and the per-player fireCooldown gate in GameRoom.handleFire paces the real
+    // rate — one round per shot, not a pelletCount burst. Each round is deliberately tiny (3 dmg,
+    // 100u range — still short), so the weapon's whole strength is its volume of
+    // fire. spawnSpread offsets each round perpendicular to the aim so the stream is a band a few
+    // units tall rather than one flat line; spreadRadians adds a little angular scatter on top.
+    projectileSpeed: 900,
     gravityScale: 0,
-    explosionRadius: 6,
-    carveRadius: 2,
-    damage: 9,
-    maxRange: 240,
-    fireCooldown: 0.08,
-    pelletCount: 6,
-    spreadRadians: 0.12,
+    explosionRadius: 3,
+    carveRadius: 1.4,
+    damage: 3,
+    headshotMultiplier: 1,
+    maxRange: 100,
+    fireCooldown: 0.05, // ~20 rounds/sec
+    spreadRadians: 0.05,
+    spawnSpread: 2.4,
   },
   mine: {
     id: "mine",
-    // Not a true placed/proximity-triggered mine (that would need a persistent stationary entity
-    // and a fuse timer, which the shared projectile model — and the client's local re-simulation of
-    // it for bullet rendering, see BulletLayer — isn't built for without desyncing the two). Instead:
-    // a heavy, slow toss that drops almost straight down and explodes on contact like everything
-    // else, but with by far the biggest single blast in the game — the "area denial" niche without
-    // new machinery.
-    projectileSpeed: 80,
-    gravityScale: 1.8,
-    explosionRadius: 50,
-    carveRadius: 18,
-    damage: 70,
-    maxRange: 90,
+    // Placed proximity mine (see GameRoom's mine handling). A click DROPS it straight down to the
+    // terrain directly under the character — it's never thrown. It arms MINE_ARM_MS after being
+    // dropped; once armed it detonates the instant any vole comes within MINE_TRIGGER_RADIUS of it,
+    // and it detonates immediately if hit by any projectile (armed or not). Not a projectile weapon
+    // — the projectile fields are unused; the blast uses explosionRadius/carveRadius/damage with
+    // linearFalloff (the vole that set it off takes the full `damage`, tapering to 0 at the edge).
+    projectileSpeed: 0,
+    gravityScale: 0,
+    explosionRadius: 30,
+    carveRadius: 12,
+    damage: 30,
+    headshotMultiplier: 1,
+    linearFalloff: true,
     fireCooldown: 1.2,
   },
   missile: {

@@ -35,6 +35,82 @@
         pointer-events: none;
         white-space: pre;
       }
+      /* Kill feed — top-right stack of recent kills (see main.ts pushKillFeed). Each row fades out on
+         its own timer; newest is prepended on top. Sits below the fps readout / volume slider. */
+      #kill-feed {
+        position: fixed;
+        top: 54px;
+        right: 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 8px;
+        pointer-events: none;
+        font: 24px monospace;
+        z-index: 20;
+      }
+      #kill-feed .kill-row {
+        padding: 6px 16px;
+        background: rgba(16, 20, 24, 0.72);
+        border: 1px solid #59524a;
+        border-radius: 12px;
+        color: #d7e0e8;
+        white-space: nowrap;
+        transition: opacity 0.4s linear;
+      }
+      #kill-feed .kill-row .kf-killer {
+        color: #8fe38f;
+        font-weight: 700;
+      }
+      #kill-feed .kill-row .kf-victim {
+        color: #ef9a9a;
+        font-weight: 700;
+      }
+      #kill-feed .kill-row .kf-verb {
+        color: #9aa4ad;
+        margin: 0 5px;
+      }
+      /* Fraction of the randomly-generated destructible terrain still standing (see
+         GameState.terrainRemaining). 100% at match start, 0% if every crater-able cell is gone. */
+      #terrain-remaining {
+        position: fixed;
+        top: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 4px 10px;
+        background: rgba(16, 20, 24, 0.7);
+        border: 1px solid #59524a;
+        border-radius: 7px;
+        color: #d7e0e8;
+        font: 12px monospace;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+      #terrain-remaining .tr-label {
+        color: #9aa4ad;
+      }
+      #terrain-remaining .tr-value {
+        color: #cdb98c;
+        font-weight: 700;
+        min-width: 38px;
+        text-align: right;
+      }
+      #terrain-remaining .tr-bar {
+        width: 84px;
+        height: 6px;
+        border-radius: 3px;
+        background: rgba(255, 255, 255, 0.12);
+        overflow: hidden;
+      }
+      #terrain-remaining .tr-bar-fill {
+        height: 100%;
+        width: 100%;
+        background: #cdb98c;
+        transition: width 0.2s linear;
+      }
       #volume-control {
         position: fixed;
         top: 30px;
@@ -72,6 +148,211 @@
         margin-bottom: 6px;
         display: block;
       }
+      /* Bottom-left readout stack: Abilities (always-on, e.g. Dig) above Superpowers (charge/cooldown
+         based, e.g. Dash). One row each: a fitting icon, its key, and any charge pips / countdown.
+         See memory: superpower-ui-convention. */
+      #left-hud {
+        position: fixed;
+        left: 10px;
+        bottom: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        pointer-events: none;
+        font: 12px monospace;
+      }
+      #abilities,
+      #superpowers {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      #left-hud .hud-group-label {
+        color: #6b7580;
+        font-size: 10px;
+        letter-spacing: 2px;
+        margin-bottom: 1px;
+      }
+      #left-hud .power {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 5px 9px 5px 6px;
+        background: rgba(16, 20, 24, 0.7);
+        border: 1px solid #59524a;
+        border-radius: 7px;
+        color: #d7e0e8;
+      }
+      #left-hud .power.ready {
+        border-color: #8fe38f;
+      }
+      #left-hud .power.empty {
+        opacity: 0.5;
+      }
+      #left-hud .power-icon {
+        display: inline-flex;
+        color: #8fe38f;
+      }
+      #left-hud .power.empty .power-icon {
+        color: #9aa4ad;
+      }
+      #left-hud .power-key {
+        padding: 1px 5px;
+        border: 1px solid currentColor;
+        border-radius: 4px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        font-size: 11px;
+        min-width: 12px;
+        text-align: center;
+      }
+      #left-hud .power-name {
+        color: #9aa4ad;
+      }
+      #left-hud .power-charges {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+      }
+      #left-hud .pip {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #8fe38f;
+        border: 1px solid #8fe38f;
+        box-sizing: border-box;
+      }
+      #left-hud .pip.spent {
+        background: transparent;
+        border-color: #6b7580;
+      }
+      #left-hud .power-cd {
+        min-width: 26px;
+        text-align: right;
+        color: #8fe38f;
+        font-weight: 700;
+      }
+      /* Brief pulse when an ability fires (see main.ts flashAbility). */
+      #abilities .power.used {
+        animation: ability-pulse 0.4s ease-out;
+      }
+      @keyframes ability-pulse {
+        0% {
+          border-color: #ffd27f;
+          box-shadow: 0 0 0 0 rgba(255, 210, 127, 0.7);
+        }
+        100% {
+          border-color: #59524a;
+          box-shadow: 0 0 0 10px rgba(255, 210, 127, 0);
+        }
+      }
+      /* Hero selection screen — full-screen overlay shown before the match (see main.ts). */
+      #hero-select {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 26px;
+        background: radial-gradient(ellipse at center, #1a2026 0%, #0c0f12 100%);
+        font-family: monospace;
+        color: #d7e0e8;
+      }
+      #hero-select h1 {
+        margin: 0;
+        font-size: 26px;
+        letter-spacing: 4px;
+        color: #8fe38f;
+        font-weight: 700;
+      }
+      #hero-select .nickname-field {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 7px;
+      }
+      #hero-select .nickname-field label {
+        font-size: 11px;
+        letter-spacing: 2px;
+        color: #9aa4ad;
+      }
+      #hero-select .nickname-input {
+        width: 240px;
+        padding: 9px 12px;
+        background: rgba(16, 20, 24, 0.85);
+        border: 1px solid #59524a;
+        border-radius: 8px;
+        color: #d7e0e8;
+        font: 15px monospace;
+        text-align: center;
+        letter-spacing: 1px;
+        outline: none;
+      }
+      #hero-select .nickname-input:focus {
+        border-color: #8fe38f;
+      }
+      #hero-select .hero-row {
+        display: flex;
+        gap: 22px;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      #hero-select .hero-card {
+        width: 190px;
+        background: rgba(16, 20, 24, 0.85);
+        border: 2px solid #59524a;
+        border-radius: 12px;
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        cursor: pointer;
+        transition: border-color 0.12s, transform 0.12s;
+      }
+      #hero-select .hero-card:hover {
+        border-color: #8fe38f;
+        transform: translateY(-4px);
+      }
+      #hero-select .hero-card img {
+        width: 150px;
+        height: 210px;
+        object-fit: contain;
+        image-rendering: auto;
+        background: rgba(0, 0, 0, 0.25);
+        border-radius: 8px;
+      }
+      #hero-select .hero-name {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-align: center;
+      }
+      #hero-select .hero-sub {
+        font-size: 11px;
+        color: #9aa4ad;
+      }
+      #hero-select .skip-btn {
+        pointer-events: auto;
+        cursor: pointer;
+        background: transparent;
+        border: 1px solid #6b7580;
+        color: #9aa4ad;
+        font: 13px monospace;
+        letter-spacing: 2px;
+        padding: 9px 26px;
+        border-radius: 8px;
+        transition: border-color 0.12s, color 0.12s;
+      }
+      #hero-select .skip-btn:hover {
+        border-color: #8fe38f;
+        color: #8fe38f;
+      }
+      #hero-select.hidden {
+        display: none;
+      }
       #winner-banner {
         display: none;
         position: fixed;
@@ -94,12 +375,127 @@
     <div id="app"></div>
     <div id="hud">connecting...</div>
     <div id="fps">-- fps</div>
+    <div id="kill-feed"></div>
+    <div id="terrain-remaining">
+      <span class="tr-label">terrain</span>
+      <span class="tr-bar"><span class="tr-bar-fill" id="terrain-remaining-fill"></span></span>
+      <span class="tr-value" id="terrain-remaining-value">100%</span>
+    </div>
     <div id="volume-control">
       <span>vol</span>
       <input id="volume-slider" type="range" min="0" max="100" step="1" />
     </div>
     <div id="hint" style="position: fixed; bottom: 8px; right: 10px; color: #9aa4ad; font: 12px monospace; pointer-events: none">
       hold Tab for scoreboard
+    </div>
+    <div id="left-hud">
+    <div id="abilities">
+      <div class="hud-group-label">ABILITIES</div>
+      <div class="power ready" id="ability-dig">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="6" y1="18" x2="13" y2="11" />
+              <path d="M11 5 h8 v8 l-3 -3 -2 2 -3 -3 2 -2 z" fill="currentColor" stroke="none" />
+              <path d="M4 20 l3 -1 -2 -2 z" fill="currentColor" stroke="none" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">HOLD&nbsp;→&nbsp;TAP</span>
+        <span class="power-name">Dig — push into a wall, tap the other way</span>
+      </div>
+    </div>
+    <div id="superpowers">
+      <div class="hud-group-label">SUPERPOWERS</div>
+      <div class="power ready" id="power-dash">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="2" y1="7" x2="7" y2="7" />
+              <line x1="2" y1="12" x2="6" y2="12" />
+              <line x1="2" y1="17" x2="7" y2="17" />
+              <polyline points="9,5 16,12 9,19" />
+              <polyline points="15,5 22,12 15,19" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">SHIFT</span>
+        <span class="power-name">Dash</span>
+        <span class="power-charges"><span class="pip"></span><span class="pip"></span></span>
+        <span class="power-cd"></span>
+      </div>
+      <div class="power ready" id="power-doublejump">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4,10 12,4 20,10" />
+              <polyline points="4,18 12,12 20,18" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">W/SPACE</span>
+        <span class="power-name">Double Jump</span>
+        <span class="power-charges"><span class="pip"></span></span>
+      </div>
+      <div class="power ready" id="power-burrow">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+              <path d="M3 5 Q12 2 21 5" />
+              <path d="M5 10 Q12 7.5 19 10" />
+              <path d="M8 15 Q12 13 16 15" />
+              <path d="M10.5 20 Q12 18.5 13.5 20" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">C</span>
+        <span class="power-name">Burrow</span>
+        <span class="power-charges"><span class="pip"></span></span>
+        <span class="power-cd"></span>
+      </div>
+      <div class="power ready" id="power-zoom">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+              <circle cx="10.5" cy="10.5" r="6.5" />
+              <line x1="15.5" y1="15.5" x2="21" y2="21" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">CTRL+SCROLL</span>
+        <span class="power-name">Zoom</span>
+      </div>
+      <div class="power ready" id="power-grapple">
+        <span class="power-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="2" x2="12" y2="14" />
+              <path d="M6 14 a6 6 0 0 0 12 0" />
+              <path d="M6 14 l-2 3 M18 14 l2 3" />
+            </g>
+          </svg>
+        </span>
+        <span class="power-key">RMB</span>
+        <span class="power-name">Grapple</span>
+      </div>
+    </div>
+    </div>
+    <div id="hero-select">
+      <h1>CHOOSE YOUR HERO</h1>
+      <div class="nickname-field">
+        <label for="nickname-input">NICKNAME</label>
+        <input
+          id="nickname-input"
+          class="nickname-input"
+          type="text"
+          maxlength="16"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="leave blank for Player #"
+        />
+      </div>
+      <div class="hero-row" id="hero-row"></div>
+      <button class="skip-btn" id="hero-skip">SKIP — use current assets</button>
     </div>
     <div id="scoreboard"></div>
     <div id="winner-banner"></div>

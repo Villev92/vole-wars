@@ -81,6 +81,20 @@ export class TerrainField {
     return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
   }
 
+  /** Number of still-solid destructible cells (DIRT + STONE). Rock is excluded — it's the
+   *  indestructible border/patches and can never be carved, so counting it would keep the
+   *  "terrain remaining" readout from ever reaching 0%. Used by the server to sync a
+   *  fraction-of-original-terrain-remaining figure for the HUD. O(width*height); the server
+   *  only calls it on a throttled cadence, not every tick. */
+  countDestructible(): number {
+    let n = 0;
+    for (let i = 0; i < this.data.length; i++) {
+      const m = this.data[i];
+      if (m === TERRAIN_DIRT || m === TERRAIN_STONE) n++;
+    }
+    return n;
+  }
+
   /**
    * Carves a capsule — a circle of `radius` swept along the segment from (x1,y1) to (x2,y2) — out of
    * destructible dirt/stone, same "rock is unaffected" rule as carveCircle. Used for a piercing

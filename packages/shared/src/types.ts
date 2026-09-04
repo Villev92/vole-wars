@@ -20,6 +20,12 @@ export interface PlayerInput {
   up: boolean;
   /** S/ArrowDown held — reels the rope out while attached. */
   down: boolean;
+  /** Left Shift held — the Dash superpower (see stepVole). Edge-triggered server-side via `dashHeld`,
+   *  so holding it dashes once per press, not once per recharge. */
+  dash: boolean;
+  /** 'C' held — the Burrow superpower (see stepVole). Edge-triggered server-side via `burrowHeld`, so
+   *  a fresh press starts (or, mid-animation, cancels) a burrow rather than repeating every tick. */
+  burrow: boolean;
 }
 
 export interface VoleSimState {
@@ -46,10 +52,38 @@ export interface VoleSimState {
    *  triggers the jump — lets a press an instant before touchdown register instead of being
    *  silently dropped for having arrived one tick too early. */
   jumpBufferTimer: number;
+  /** Double Jump superpower: true whenever the extra air jump is available. Starts true, spent by one
+   *  jump taken while genuinely airborne (see stepVole), and refilled the instant the vole is grounded
+   *  again — a landing-based reset, not a cooldown timer. */
+  doubleJumpAvailable: boolean;
   ropeActive: boolean;
   ropeAnchorX: number;
   ropeAnchorY: number;
   ropeLength: number;
+  /** Stored Dash superpower charges (0..DASH_MAX_CHARGES). Each dash spends one; see stepVole. */
+  dashCharges: number;
+  /** Seconds until the next dash charge is restored — only meaningful while dashCharges is below max
+   *  (see stepVole / DASH_RECHARGE). */
+  dashRechargeTimer: number;
+  /** True from the instant a dash press is registered until Shift is released — a fresh press (not
+   *  just still holding it once the cooldown clears) is required to dash again. */
+  dashHeld: boolean;
+  /** True while a Burrow (see stepVole) is in progress — the vole is scripted straight down
+   *  BURROW_DEPTH terrain units over BURROW_DURATION seconds, ignoring terrain collision entirely for
+   *  the duration. */
+  burrowActive: boolean;
+  /** Seconds elapsed since the current burrow began (0 when not burrowing) — drives the descent's
+   *  progress (elapsed / BURROW_DURATION) and, client-side, the tornado-spin animation. */
+  burrowElapsed: number;
+  /** The vole's y at the instant the current burrow began — the descent is startY + BURROW_DEPTH *
+   *  progress, not an incremental per-tick move, so this anchor has to be remembered. */
+  burrowStartY: number;
+  /** Seconds until the next burrow can start — set to BURROW_COOLDOWN the instant one begins (not
+   *  when it ends). */
+  burrowCooldownTimer: number;
+  /** True from the instant a burrow press is registered until 'C' is released — a fresh press (not
+   *  just still holding it) is required to start (or cancel) the next one. */
+  burrowHeld: boolean;
 }
 
 export interface CorpseSimState {

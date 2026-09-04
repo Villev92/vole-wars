@@ -108,8 +108,9 @@ export function drawRailgunImpactFlash(g: Graphics, t: number): void {
 
 /** A single buckshot pellet — a plain round ball with a small tracer streak, smaller than the AK's slug. */
 export function drawShotgunPellet(g: Graphics): void {
-  g.moveTo(-3, 0).lineTo(-0.8, -0.25).lineTo(-0.8, 0.25).closePath().fill({ color: 0xffe9a8, alpha: 0.5 });
-  g.circle(0.4, 0, 1.1).fill(0x8a8f96).stroke({ width: 0.3, color: 0x241a13 });
+  // A small round lead ball — buckshot, no tracer streak.
+  g.circle(0, 0, 1.15).fill(0x9aa0a8).stroke({ width: 0.3, color: 0x241a13 });
+  g.circle(-0.4, -0.4, 0.42).fill({ color: 0xe6eaef, alpha: 0.75 });
 }
 
 /** A single minigun round — like the AK's tracer slug but tinier, for a rapid-burst stream of them. */

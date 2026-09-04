@@ -3,6 +3,11 @@ import type { WeaponDef } from "./weapons.js";
 import type { CorpseSimState, DamageEvent, PlayerInput, ProjectileSimState, VoleSimState } from "./types.js";
 
 export const GRAVITY = 900; // px/s^2
+// Descending voles fall at this fraction of full gravity — "players fall too fast" feedback
+// (2026-08-30). Applied only while vole.vy > 0 (falling), so the jump *rise* keeps its full-gravity
+// arc and only the come-down is slowed to 80%. Does not touch the rope swing or projectiles, which
+// use GRAVITY directly.
+export const FALL_GRAVITY_SCALE = 0.8;
 // Matched to the client's character art proportions (apps/client/src/voleArt.ts's
 // FOOT_GROUND_Y * ENTITY_SCALE, currently 15.5 * 0.225 ≈ 3.5) rather than the other way around —
 // the art has no separate leg piece to stretch, so for the feet to both stay attached to the torso
@@ -31,6 +36,38 @@ const JUMP_COOLDOWN = 0.04; // seconds
 // until you look down. Without this, a press that lands one tick after grounded flips false reads as
 // a missed jump even though the player was standing on solid ground a moment ago.
 const COYOTE_TIME = 0.1; // seconds
+// --- Dash superpower (see memory: super powers) ---------------------------------------------------
+// A fresh Left Shift press blinks the vole DASH_DISTANCE terrain units along its current aim, spending
+// one dash charge. Only a genuine WALL stops it: the dash walks its own centre line and halts a
+// body-radius short of the first solid span at least DASH_WALL_MIN_DEPTH units thick — incidental
+// contact (a bump underfoot, a ledge lip, the ground grazed while dashing low, a one-cell speck)
+// is passed straight through, and the vole is de-penetrated on arrival if it lands clipping terrain.
+// Distances are terrain units (the weapon sheet's "metres"). Was 150, cut to 75% of that (112.5),
+// then cut again to 80% of THAT at the user's request.
+export const DASH_DISTANCE = 90;
+// The vole holds up to DASH_MAX_CHARGES dashes and regains one every DASH_RECHARGE seconds. The
+// recharge timer runs on a steady cadence whenever charges aren't full — dashing again before the
+// first charge is back doesn't reset it, so two spent charges refill at +5s and +10s, not +10s both.
+export const DASH_MAX_CHARGES = 2;
+export const DASH_RECHARGE = 5; // seconds to regain one charge
+// Dash centre-line probe: step size for walking the path, and the minimum thickness of solid
+// material along it that counts as a wall worth stopping for. Anything thinner is dashed through.
+const DASH_PROBE_STEP = 1;
+const DASH_WALL_MIN_DEPTH = 4;
+
+// --- Burrow superpower (see memory: super powers) --------------------------------------------------
+// A fresh 'C' press sends the vole straight down BURROW_DEPTH terrain units over BURROW_DURATION
+// seconds — a scripted vertical move, not a physics fall, and deliberately not terrain-aware at all:
+// the whole point is digging through solid ground, so it ignores collision entirely for the
+// duration rather than stopping at the first wall the way dash does. A second 'C' press mid-animation
+// cancels it in place. Either way (finished or cancelled), normal collision/movement — including the
+// standard depenetration check stepVole always runs — resumes the same tick, so a vole that ends up
+// embedded in solid dirt when the burrow ends gets nudged clear like anything else that lands inside
+// terrain.
+export const BURROW_DEPTH = 50;
+export const BURROW_DURATION = 1.2; // seconds to complete the full descent
+export const BURROW_COOLDOWN = 5; // seconds before the next burrow, started the instant one begins
+
 // Jump input buffering: a press that arrives up to this long BEFORE touchdown still fires the jump
 // the instant landing (or coyote time) makes it valid, rather than being silently dropped for having
 // arrived one tick too early — the single biggest source of "jump feels unresponsive" complaints in
@@ -155,6 +192,45 @@ const STEP_SEARCH_INCREMENT = 0.5;
 // the work here, this just bridges the gap sweepAxis's single-tick gravity fall doesn't cover yet.
 const DOWNHILL_SNAP_DISTANCE = 4;
 
+// --- Dig ability (see GameRoom.handleDig) --------------------------------------------------------
+// Unlike the loot-able superpowers, every vole HAS Dig from the start. Standing against a wall,
+// holding the movement key INTO it and tapping the opposite key bores a short tunnel along the aim.
+// DIG_REACH is how far a single tap digs; DIG_RADIUS is the tunnel's half-width — a bit over
+// VOLE_RADIUS so the vole fits through what it just dug. A dig may slope up or down but never
+// steeper than the vole can then WALK back up: DIG_MAX_ASCEND_SLOPE (rise/run) is taken from the
+// ledge-climb the ordinary walk already does — STEP_HEIGHT of lift per one tick's MOVE_SPEED*SIM_DT
+// of forward travel — with a safety factor so a tunnel cut at exactly the limit stays traversable.
+// The same magnitude caps a downward dig too: the user wants the up/down limit symmetric, set by
+// the harder (upward) case. The 0.6 factor is empirical (see dev/dig-test.ts): the bare
+// STEP_HEIGHT-per-tick ratio (~57°) is NOT actually walkable in a tunnel — tryStepUp has to clear
+// the whole lifted move between confining walls — but ~43° is, with margin.
+// DIG_REACH cut 15 -> 5 -> 4 -> 2: "reduce the terrain a dig destroys" is about the dig DEPTH per
+// tap, not the tunnel width — DIG_RADIUS stays > VOLE_RADIUS so the vole still fits through what it
+// dug. At 2 the per-tap advance is under one body radius, so it takes several taps to bore a
+// vole-length of tunnel.
+export const DIG_REACH = 2;
+export const DIG_RADIUS = VOLE_RADIUS + 1.0;
+export const DIG_MAX_ASCEND_SLOPE = 0.6 * (STEP_HEIGHT / (MOVE_SPEED * SIM_DT));
+
+/**
+ * The unit direction a dig actually travels: the vole's aim, but (a) null if it points away from
+ * the wall the vole is pressed against (`intoDir`: -1 = wall on the left, +1 = wall on the right —
+ * the player has to be looking the way they're digging), and (b) clamped so it's never steeper
+ * than DIG_MAX_ASCEND_SLOPE, up OR down.
+ */
+export function resolveDigDirection(aimAngle: number, intoDir: -1 | 1): { x: number; y: number } | null {
+  const base = intoDir === 1 ? 0 : Math.PI;
+  // Signed angle between the aim and "straight into the wall", wrapped to [-PI, PI].
+  let delta = Math.atan2(Math.sin(aimAngle - base), Math.cos(aimAngle - base));
+  // Facing away from the wall (more than ~80° off the into-wall horizontal): no dig at all.
+  if (Math.abs(delta) >= Math.PI / 2 - 0.17) return null;
+  const maxOff = Math.atan(DIG_MAX_ASCEND_SLOPE);
+  if (delta > maxOff) delta = maxOff;
+  else if (delta < -maxOff) delta = -maxOff;
+  const ang = base + delta;
+  return { x: Math.cos(ang), y: Math.sin(ang) };
+}
+
 function tryStepUp(
   terrain: TerrainField,
   x: number,
@@ -241,6 +317,24 @@ export function raycastTerrain(
     if (terrain.isSolid(cx, cy)) return { x: cx, y: cy };
   }
   return null;
+}
+
+/** Shortest distance from point (px,py) to the line segment (ax,ay)–(bx,by). Used for beam-vs-vole
+ *  contact tests (railgun — a vole touching any part of the beam takes damage). */
+export function pointSegmentDistance(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number
+): number {
+  const abx = bx - ax;
+  const aby = by - ay;
+  const lenSq = abx * abx + aby * aby;
+  let t = lenSq > 0 ? ((px - ax) * abx + (py - ay) * aby) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * abx), py - (ay + t * aby));
 }
 
 // Recast every tick the button is held and not yet attached (rather than once on the initial
@@ -357,8 +451,86 @@ function stepSwing(vole: VoleSimState, input: PlayerInput, terrain: TerrainField
   vole.grounded = false;
 }
 
+// Edge-triggered start/cancel (burrowHeld, same pattern as dashHeld) plus the scripted descent
+// itself. Runs unconditionally every tick — including while already burrowing, since that's the only
+// place the descent and the cooldown countdown are advanced.
+function updateBurrow(vole: VoleSimState, input: PlayerInput, terrain: TerrainField, dt: number): void {
+  if (!vole.burrowActive && vole.burrowCooldownTimer > 0) {
+    vole.burrowCooldownTimer = Math.max(0, vole.burrowCooldownTimer - dt);
+  }
+
+  if (!input.burrow) vole.burrowHeld = false;
+  if (input.burrow && !vole.burrowHeld) {
+    vole.burrowHeld = true;
+    if (vole.burrowActive) {
+      // A second press mid-animation cancels it in place.
+      vole.burrowActive = false;
+    } else if (vole.burrowCooldownTimer <= 0 && !vole.ropeActive) {
+      vole.burrowActive = true;
+      vole.burrowElapsed = 0;
+      vole.burrowStartY = vole.y;
+      // Cooldown starts the instant the burrow begins, not when it ends.
+      vole.burrowCooldownTimer = BURROW_COOLDOWN;
+      vole.vx = 0;
+      vole.vy = 0;
+    }
+  }
+
+  if (vole.burrowActive) {
+    vole.burrowElapsed += dt;
+    const t = Math.min(1, vole.burrowElapsed / BURROW_DURATION);
+    let targetY = vole.burrowStartY + BURROW_DEPTH * t;
+
+    // The whole point of Burrow is ignoring terrain — EXCEPT the map's own border, which is always
+    // indestructible ROCK (see TerrainField.generateCaves) and is the ONLY thing on the map that
+    // ever is, so "the first ROCK cell straight down" and "the edge of the playable map" are the same
+    // thing. Scanning for it and clamping the descent a body-radius short — the same idea as Dash
+    // stopping short of a real wall — is what actually keeps a burrow inside the map. An earlier
+    // version only clamped to the literal terrain.height array bound, which still let the vole land
+    // INSIDE the (32-unit-thick by default) rock border itself: technically in-bounds data-wise, but
+    // not on the playable map, and not always recoverable — findNearestClearSpot's depenetration
+    // search only reaches DEPENETRATE_MAX_RING, which a deep-enough landing inside that border can
+    // exceed entirely, leaving the vole stuck past the edge with no way back.
+    //
+    // Hitting the border only CLAMPS the vole's depth — it does NOT end the burrow. An earlier
+    // version cancelled `burrowActive` the instant the clamp engaged, which meant a vole already
+    // standing on the bottom rock border (rockY within a body radius of burrowStartY, so the clamp
+    // engages on the very first tick) got its whole burrow — animation, cooldown and all — eaten
+    // before it visibly started. Now the tornado spins in place for its full BURROW_DURATION against
+    // the border; it just can't dig through it.
+    const scanFrom = Math.floor(vole.burrowStartY);
+    const scanTo = Math.ceil(vole.burrowStartY + BURROW_DEPTH);
+    const vx = Math.floor(vole.x);
+    let rockY: number | null = null;
+    for (let y = scanFrom; y <= scanTo; y++) {
+      if (terrain.get(vx, y) === TERRAIN_ROCK) {
+        rockY = y;
+        break;
+      }
+    }
+    if (rockY !== null) {
+      const maxY = Math.max(vole.burrowStartY, rockY - VOLE_RADIUS);
+      if (targetY >= maxY) targetY = maxY;
+    }
+
+    vole.y = targetY;
+    if (t >= 1) vole.burrowActive = false;
+  }
+}
+
 export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: TerrainField, dt: number): void {
   if (!vole.alive) return;
+
+  // Burrow takes over movement entirely while active, and must run before the depenetration check
+  // below — a burrowing vole deliberately sits inside solid terrain, which that check would otherwise
+  // immediately undo. Resolved (started/advanced/cancelled/finished) here regardless of alive-only
+  // gating above, then short-circuits the rest of this tick's normal physics while still in progress.
+  updateBurrow(vole, input, terrain, dt);
+  vole.aimAngle = input.aimAngle;
+  if (vole.burrowActive) {
+    vole.grounded = false;
+    return;
+  }
 
   if (circleHitsTerrain(terrain, vole.x, vole.y, VOLE_RADIUS)) {
     const clear = findNearestClearSpot(terrain, vole.x, vole.y, VOLE_RADIUS);
@@ -368,16 +540,82 @@ export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: Terrai
     }
   }
 
-  vole.aimAngle = input.aimAngle;
-
   updateRopeAttachment(vole, input, terrain);
+
+  // Dash superpower: a fresh Left Shift press blinks the vole DASH_DISTANCE along its aim, spending
+  // one of up to DASH_MAX_CHARGES stored dashes. Only a genuine wall stops it (see below); incidental
+  // terrain contact does not. Edge-triggered (dashHeld) so holding Shift dashes once per press. Not
+  // available while on the rope (its own movement model).
+  //
+  // Recharge: dashRechargeTimer counts down whenever charges aren't full; on reaching 0 it restores
+  // one charge and, if still not full, rolls the remainder forward by DASH_RECHARGE so the cadence
+  // stays a steady one-per-DASH_RECHARGE-seconds rather than restarting per charge.
+  if (vole.dashCharges < DASH_MAX_CHARGES) {
+    vole.dashRechargeTimer -= dt;
+    if (vole.dashRechargeTimer <= 0) {
+      vole.dashCharges += 1;
+      vole.dashRechargeTimer = vole.dashCharges < DASH_MAX_CHARGES ? vole.dashRechargeTimer + DASH_RECHARGE : 0;
+    }
+  }
+  if (!input.dash) vole.dashHeld = false;
+  if (input.dash && !vole.dashHeld && !vole.ropeActive && vole.dashCharges > 0) {
+    vole.dashHeld = true;
+    // Starting from full kicks off the recharge clock; a further spend leaves it running.
+    if (vole.dashCharges === DASH_MAX_CHARGES) vole.dashRechargeTimer = DASH_RECHARGE;
+    vole.dashCharges -= 1;
+
+    const dashDirX = Math.cos(vole.aimAngle);
+    const dashDirY = Math.sin(vole.aimAngle);
+    // Walk the dash's centre line. Stop a body-radius short of the first solid span that stays solid
+    // for at least DASH_WALL_MIN_DEPTH units — that's a wall. A thinner run (a speck, a ledge lip,
+    // ground clipped at a shallow angle) is hopped over and the scan continues, so incidental
+    // contact never cancels the dash. Nothing solid found → the full DASH_DISTANCE.
+    let dashTravel = DASH_DISTANCE;
+    let probe = DASH_PROBE_STEP;
+    while (probe < DASH_DISTANCE) {
+      if (terrain.isSolid(vole.x + dashDirX * probe, vole.y + dashDirY * probe)) {
+        let depth = 0;
+        while (
+          depth < DASH_WALL_MIN_DEPTH &&
+          terrain.isSolid(vole.x + dashDirX * (probe + depth), vole.y + dashDirY * (probe + depth))
+        ) {
+          depth += DASH_PROBE_STEP;
+        }
+        if (depth >= DASH_WALL_MIN_DEPTH) {
+          dashTravel = Math.max(0, probe - VOLE_RADIUS);
+          break;
+        }
+        probe += depth; // thin — skip past it and keep scanning
+      }
+      probe += DASH_PROBE_STEP;
+    }
+    vole.x += dashDirX * dashTravel;
+    vole.y += dashDirY * dashTravel;
+    // Landed clipping terrain (low tunnel, stopped against a wall, punched through a sliver into a
+    // tight pocket)? Nudge to the nearest clear spot rather than the dash reading as a stuck vole.
+    if (circleHitsTerrain(terrain, vole.x, vole.y, VOLE_RADIUS)) {
+      const clear = findNearestClearSpot(terrain, vole.x, vole.y, VOLE_RADIUS);
+      if (clear) {
+        vole.x = clear.x;
+        vole.y = clear.y;
+      }
+    }
+    // A blink, not a shove — drop carried momentum so a dash out of a fall doesn't fling the vole.
+    vole.vx = 0;
+    vole.vy = 0;
+    vole.grounded = false;
+  }
 
   if (vole.ropeActive) {
     stepSwing(vole, input, terrain, dt);
     return;
   }
 
-  vole.vx = input.left ? -MOVE_SPEED : input.right ? MOVE_SPEED : 0;
+  // Opposing horizontal inputs cancel to a standstill rather than letting `left` always win. This
+  // is what the Dig gesture needs: digging RIGHT means holding D and tapping A, and with the old
+  // `left ? -SPEED : ...` the tapped A would shove the vole left off the wall for those few frames.
+  // Both-held is not a meaningful move input anyway.
+  vole.vx = input.left === input.right ? 0 : input.left ? -MOVE_SPEED : MOVE_SPEED;
 
   // Captured before the jump trigger below can flip vole.grounded to false, and used again after
   // this tick's Y-sweep recomputes it — see the landing-edge check at the bottom of this function.
@@ -407,9 +645,25 @@ export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: Terrai
     vole.grounded = false;
     vole.jumpBufferTimer = 0;
     vole.coyoteTimer = 0;
+  } else if (
+    !wasGrounded &&
+    vole.coyoteTimer <= 0 &&
+    vole.jumpBufferTimer > 0 &&
+    vole.jumpCooldown <= 0 &&
+    vole.doubleJumpAvailable
+  ) {
+    // Double Jump superpower: one extra jump usable while genuinely airborne (past coyote time — a
+    // press that still lands within the coyote window took the branch above instead, as an ordinary
+    // ground jump, and never touches this charge). Same jumpHeld/jumpBufferTimer edge-trigger as the
+    // ground jump reuses this one shared key (W/ArrowUp/Space) rather than needing its own. Resets on
+    // landing (see the grounded block below), not on a timer.
+    vole.vy = -JUMP_SPEED;
+    vole.jumpBufferTimer = 0;
+    vole.doubleJumpAvailable = false;
   }
 
-  vole.vy += GRAVITY * dt;
+  // Full gravity on the way up (crisp jump), FALL_GRAVITY_SCALE on the way down (softer fall).
+  vole.vy += GRAVITY * (vole.vy > 0 ? FALL_GRAVITY_SCALE : 1) * dt;
 
   const moveX = sweepAxis(terrain, vole.x, vole.y, vole.vx * dt, 0, true);
   if (moveX.blocked && vole.grounded && vole.vx !== 0) {
@@ -458,6 +712,8 @@ export function stepVole(vole: VoleSimState, input: PlayerInput, terrain: Terrai
   // always counts from the LAST tick the vole was actually standing on something, however that ended.
   if (vole.grounded) {
     vole.coyoteTimer = COYOTE_TIME;
+    // Double Jump charge refills the moment the vole is standing on something again — not a timer.
+    vole.doubleJumpAvailable = true;
   }
 }
 

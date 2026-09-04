@@ -53,8 +53,8 @@ function fitSpriteInBox(sprite: Sprite, boxSize: number, padding: number, boost 
 
 /**
  * Bottom-center weapon bar: ten fixed slots (see weaponIcons.ts's WEAPON_IDS), selectable with the
- * 1-9/0 keys or the scroll wheel. Only tracks the current selection — main.ts reads `selectedId`
- * to decide what's held/fired.
+ * 1-9/0 keys or the scroll wheel (holding Shift while scrolling zooms the camera instead). Only
+ * tracks the current selection — main.ts reads `selectedId` to decide what's held/fired.
  */
 export class WeaponSelector {
   readonly container: Container;

@@ -3,7 +3,12 @@ import {
   applyExplosion,
   circleHitsTerrain,
   DEFAULT_WEAPON_ID,
+  DIG_RADIUS,
+  DIG_REACH,
+  GRAVITY,
   MAX_HEALTH,
+  pointSegmentDistance,
+  resolveDigDirection,
   PROJECTILE_OWNER_CLEARANCE,
   raycastTerrain,
   SIM_DT,
@@ -17,9 +22,10 @@ import {
   type CorpseSimState,
   type PlayerInput,
   type ProjectileSimState,
+  type VoleHitTarget,
   type VoleSimState,
 } from "@vole-wars/shared";
-import { BurnSchema, CorpseSchema, GameState, VoleSchema } from "./state.js";
+import { BurnSchema, CorpseSchema, GameState, MineSchema, VoleSchema } from "./state.js";
 
 const TICK_RATE = SIM_TICK_RATE;
 const DT = SIM_DT;
@@ -35,6 +41,11 @@ const MAX_PLAYERS = 8;
 // Fixed id (not a Colyseus sessionId, since it's never a real connected client) for the always-on
 // dummy punching-bag player: takes damage/knockback like a real vole but never moves/aims/fires.
 const BOT_ID = "bot";
+
+// Selectable hero-art ids (mirrors apps/client/src/heroes.ts — kept as a plain list here rather than
+// shared, since the server only needs to validate the join option, not know anything about the art).
+const HERO_IDS = ["burrows", "bristle", "moss"] as const;
+type HeroId = (typeof HERO_IDS)[number];
 
 // Every vole (bot and human alike) auto-respawns this long after death — no client-triggered
 // "Start Again" button anymore. A placeholder value the user expects to tune later.
@@ -68,7 +79,57 @@ const MAX_BURNS = 80; // hard cap on simultaneously-tracked burn patches
 // Minimum gap between the "grunt" sounds a single vole triggers from fire/fall damage, so a burn
 // patch's fast DoT doesn't machine-gun grunts.
 const GRUNT_MIN_GAP_MS = 600;
-const BURN_CONTACT_RADIUS = VOLE_RADIUS + 3; // how close a vole must be to a burn patch to be burned by it
+// A vole takes burn-patch damage when its body edge reaches the patch: dist(centre, marker) <=
+// VOLE_RADIUS + burnRadius, where burnRadius also sizes the client's fire visual. Keeps "am I
+// standing in fire" matching what's actually drawn (that mismatch was the bug).
+const BURN_CONTACT_RADIUS = VOLE_RADIUS + (WEAPONS.flamethrower.burnRadius ?? 4.5);
+
+// --- Railgun (see weapons.ts railgun def) ----------------------------------------------------------
+// Also not a projectile weapon: the client sends a `railgun` hold message ({charging:true} on
+// press, {charging:false} on release). The server times the charge itself (railChargeStart), and on
+// release spawns a beam whose damage-per-second / reach / half-width / lifetime / dig radius all
+// scale with the charge fraction c. TERRAIN BLOCKS the beam — each tick it reaches only to the first
+// solid cell along the aim (capped at its charge-scaled range), damages any vole that segment
+// touches, and on a throttled cadence chews a `digRadius` bite out of the front (a capsule from the
+// vole's own position to the front, so the ground under the player's feet goes too). Rock isn't
+// carvable, so a rock front is a permanent stop until the aim moves off it.
+const RAIL_MUZZLE_DIST = VOLE_RADIUS + 4; // beam origin for rendering/damage, matches FLAME_MUZZLE_DIST
+const RAIL_DMG_TICK_S = 0.2; // DoT cadence — 5 hits/s, fractional damage carried between ticks
+const RAIL_CARVE_TICK_S = 0.08; // dig + broadcast cadence; penetration ≈ digRadius / this
+const RAIL_CHARGE_MS = WEAPONS.railgun.railgunChargeMs ?? 4000;
+const RAIL_MAX_BEAM_MS = WEAPONS.railgun.railgunMaxBeamMs ?? 4000;
+const RAIL_MIN_DPS = WEAPONS.railgun.railgunMinDps ?? 1;
+const RAIL_MAX_DPS = WEAPONS.railgun.railgunMaxDps ?? 30;
+const RAIL_MIN_RANGE = WEAPONS.railgun.railgunMinRange ?? 12;
+const RAIL_MAX_RANGE = WEAPONS.railgun.railgunMaxRange ?? 75;
+const RAIL_MIN_HALF_WIDTH = WEAPONS.railgun.railgunMinHalfWidth ?? 0.35;
+const RAIL_MAX_HALF_WIDTH = WEAPONS.railgun.railgunMaxHalfWidth ?? 3;
+const RAIL_MIN_BEAM_MS = WEAPONS.railgun.railgunMinBeamMs ?? 120;
+const RAIL_DIG_MIN_R = WEAPONS.railgun.railgunDigMinRadius ?? 1;
+const RAIL_DIG_MAX_R = WEAPONS.railgun.railgunDigMaxRadius ?? 4;
+
+// --- Burrow (see physics.ts stepVole / BURROW_* constants) -------------------------------------------
+// The one part of Burrow that isn't handled by stepVole itself: while a vole is mid-burrow, any OTHER
+// vole whose body comes within reach takes a flat hit + knockback, like brushing a spinning drill.
+// Radius is body-to-body contact (two VOLE_RADIUS circles touching). Once per burrow activation per
+// victim (see burrowHitVictims) — otherwise a 1.2s animation at 30Hz would tick 40 dmg dozens of
+// times before knockback has a chance to separate the two.
+const BURROW_CONTACT_RADIUS = VOLE_RADIUS * 2;
+const BURROW_CONTACT_DAMAGE = 40;
+const BURROW_CONTACT_KNOCKBACK = 260; // matches applyExplosion's own knockback magnitude
+// Burrow destroys the terrain it digs through — a circle this wide carved at the vole's own position
+// every tick it's burrowing (activation tick through the completion/cancel tick inclusive). Wider than
+// VOLE_RADIUS so the tunnel reads as "a body dug through here", not a bullet-thin bore; consecutive
+// ticks' circles overlap heavily (only ~1.4 units of descent per tick) so the tunnel comes out smooth
+// with no gaps, same reasoning as why a projectile's per-step terrain sampling doesn't need to be
+// swept — the steps are already closer together than the radius.
+const BURROW_CARVE_RADIUS = 5.4; // was 6, narrowed to 90% of that at the user's request
+
+// --- Mines (see weapons.ts mine def) ----------------------------------------------------------------
+const MINE_ARM_MS = 5_000; // no proximity damage for this long after being dropped
+const MINE_TRIGGER_RADIUS = 0.5; // a vole whose body comes this close to an armed mine sets it off
+const MINE_RADIUS = 1.5; // the mine's own size, for its fall-to-terrain rest check
+const MAX_MINES = 40; // hard cap; oldest is removed to make room
 
 const IDLE_INPUT: PlayerInput = {
   left: false,
@@ -79,6 +140,8 @@ const IDLE_INPUT: PlayerInput = {
   grapple: false,
   up: false,
   down: false,
+  dash: false,
+  burrow: false,
 };
 
 export class GameRoom extends Room<GameState> {
@@ -117,6 +180,28 @@ export class GameRoom extends Room<GameState> {
   // by wall-clock `until`. ownerId is who lit it, for kill attribution on burn-patch deaths.
   private burns: { id: string; x: number; y: number; until: number; ownerId: string }[] = [];
   private burnSeq = 0;
+  // Railgun (see RAIL_* constants). railCharging: sessionId -> Date.now() the current charge began
+  // (present only while holding). railBeams: sessionId -> an in-flight beam fired on release, its
+  // dps/reach(`length`)/halfWidth/digRadius locked in from the charge, `endsAt` its wall-clock
+  // expiry, `lastCarveAt` when it last chewed the terrain front. railDot: victimId -> { acc (time
+  // toward next DoT tick), carry (fractional damage carried between ticks) }.
+  private railCharging = new Map<string, number>();
+  private railBeams = new Map<
+    string,
+    {
+      dps: number;
+      length: number;
+      halfWidth: number;
+      digRadius: number;
+      endsAt: number;
+      lastCarveAt: number;
+    }
+  >();
+  private railDot = new Map<string, { acc: number; carry: number }>();
+  // Server-only mine state (fall velocity, whether it's landed, when it was dropped for the arm
+  // timer), keyed the same as the synced MineSchema map.
+  private mineSim = new Map<string, { vy: number; grounded: boolean; deployedAt: number }>();
+  private mineSeq = 0;
   // Fall-damage tracking: the highest point (smallest y) a vole has reached while airborne since it
   // last left the ground. On landing, the drop from that peak is turned into damage (see
   // FALL_MIN_FRACTION / update). fallSpawnGrace skips the first landing after a (re)spawn so the
@@ -125,12 +210,23 @@ export class GameRoom extends Room<GameState> {
   private fallSpawnGrace = new Set<string>();
   // Last time each vole triggered a fire/fall grunt sound (see GRUNT_MIN_GAP_MS / applyDamage).
   private lastGruntAt = new Map<string, number>();
+  // Burrow contact damage (see BURROW_CONTACT_* / updateBurrowContacts): burrowerId -> the set of
+  // victim ids already hit during the CURRENT burrow activation, so the 1.2s animation doesn't
+  // machine-gun the same hit every tick. Cleared the instant that vole stops burrowing.
+  private burrowHitVictims = new Map<string, Set<string>>();
+  // Terrain-remaining HUD figure (see GameState.terrainRemaining): the destructible-cell count of
+  // the freshly-generated arena, captured once, is the 100% baseline. terrainStatTick throttles the
+  // full-grid rescan that produces the current figure to a few times a second.
+  private terrainInitialDestructible = 1;
+  private terrainStatTick = 0;
 
   onCreate(): void {
     this.setState(new GameState());
 
     const seed = Math.floor(Math.random() * 0xffffffff);
     this.terrain = TerrainField.generateCaves(ARENA_WIDTH, ARENA_HEIGHT, seed);
+    this.terrainInitialDestructible = Math.max(1, this.terrain.countDestructible());
+    this.state.terrainRemaining = 1;
     this.spawnBot();
 
     this.onMessage("input", (client, message: PlayerInput) => {
@@ -139,6 +235,13 @@ export class GameRoom extends Room<GameState> {
 
     this.onMessage("fire", (client, message: { weaponId?: string; power?: number }) => {
       this.handleFire(client.sessionId, message?.weaponId, message?.power);
+    });
+
+    // Dig ability (see handleDig / physics.ts DIG_* + resolveDigDirection). One-shot, sent by the
+    // client the instant it detects the gesture (hold a move key into a wall, tap the opposite key);
+    // `dir` is the direction held INTO the wall (-1 left, +1 right).
+    this.onMessage("dig", (client, message: { dir?: number }) => {
+      this.handleDig(client.sessionId, message?.dir === -1 ? -1 : message?.dir === 1 ? 1 : 0);
     });
 
     // Flamethrower hold state (see the flaming map / FLAME_* constants). The client sends this on
@@ -150,6 +253,26 @@ export class GameRoom extends Room<GameState> {
         if (!this.flaming.has(client.sessionId)) this.flaming.set(client.sessionId, Date.now());
       } else {
         this.stopFlaming(client.sessionId);
+      }
+    });
+
+    // Railgun charge/fire (see RAIL_* constants). {charging:true} starts timing a charge (ignored if
+    // the weapon's still on fireCooldown, so a doomed charge isn't begun); {charging:false} releases
+    // it — firing a beam sized by however long it was held. The server times the charge itself so a
+    // client can't spoof a max-charge shot.
+    this.onMessage("railgun", (client, message: { charging?: boolean; cancel?: boolean }) => {
+      const sid = client.sessionId;
+      if (message?.charging) {
+        if (this.railCharging.has(sid)) return;
+        const last = this.lastFireAt.get(sid)?.get("railgun") ?? 0;
+        if (Date.now() - last < (WEAPONS.railgun.fireCooldown ?? 0) * 1000) return;
+        this.railCharging.set(sid, Date.now());
+      } else if (message?.cancel) {
+        this.railCharging.delete(sid);
+        const vole = this.state.voles.get(sid);
+        if (vole) vole.railgunCharge = 0;
+      } else {
+        this.releaseRailgun(sid);
       }
     });
 
@@ -167,10 +290,35 @@ export class GameRoom extends Room<GameState> {
     this.setSimulationInterval(() => this.update(), 1000 / TICK_RATE);
   }
 
-  onJoin(client: Client): void {
+  /** Turns a client-supplied nickname into a safe display name, or null if it's unusable. Strips
+   *  control chars and HTML-significant characters (the scoreboard renders displayName via innerHTML
+   *  — see main.ts), collapses whitespace, trims, and caps length. The client also enforces
+   *  maxlength=16, but this is the authoritative guard. */
+  private sanitizeName(raw: unknown): string | null {
+    if (typeof raw !== "string") return null;
+    const cleaned = raw
+      .split("")
+      .filter((ch) => {
+        const code = ch.charCodeAt(0);
+        return code >= 0x20 && code !== 0x7f && !"<>&\"'`".includes(ch);
+      })
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 16);
+    return cleaned.length > 0 ? cleaned : null;
+  }
+
+  onJoin(client: Client, options?: { name?: string; hero?: string }): void {
     const vole = new VoleSchema();
     vole.id = client.sessionId;
-    vole.displayName = `Player ${this.nextPlayerNumber++}`;
+    // Join order still advances even when a nickname was given, so a later player who skips gets a
+    // number matching when they actually joined.
+    const playerNumber = this.nextPlayerNumber++;
+    vole.displayName = this.sanitizeName(options?.name) ?? `Player ${playerNumber}`;
+    // Per-player hero art — synced so every client renders this vole with its owner's pick. Unknown
+    // / missing (e.g. the "Skip" button) falls back to the built-in Burrows set.
+    vole.heroId = HERO_IDS.includes(options?.hero as HeroId) ? (options!.hero as HeroId) : "burrows";
     const spawn = this.findClearSpawn();
     vole.x = spawn.x;
     vole.y = spawn.y;
@@ -189,9 +337,12 @@ export class GameRoom extends Room<GameState> {
     this.lastFireAt.delete(client.sessionId);
     this.stopFlaming(client.sessionId);
     this.flameDot.delete(client.sessionId);
+    this.stopRailgun(client.sessionId);
+    this.railDot.delete(client.sessionId);
     this.fallPeakY.delete(client.sessionId);
     this.fallSpawnGrace.delete(client.sessionId);
     this.lastGruntAt.delete(client.sessionId);
+    this.burrowHitVictims.delete(client.sessionId);
   }
 
   /** Ends a flamethrower squeeze: drops the hold state (freeing the FLAME_MAX_MS budget) and clears
@@ -202,12 +353,60 @@ export class GameRoom extends Room<GameState> {
     if (vole) vole.flaming = false;
   }
 
+  /** Fires a railgun beam sized by however long `sessionId` has been charging, then clears the
+   *  charge. No-op if they weren't charging. The beam itself lives in railBeams and is resolved each
+   *  tick by updateRailgun. */
+  private releaseRailgun(sessionId: string): void {
+    const startedAt = this.railCharging.get(sessionId);
+    this.railCharging.delete(sessionId);
+    if (startedAt === undefined) return;
+    const vole = this.state.voles.get(sessionId);
+    if (!vole || !vole.alive) {
+      if (vole) vole.railgunCharge = 0;
+      return;
+    }
+    const chargeMs = Math.min(Date.now() - startedAt, RAIL_CHARGE_MS);
+    const c = chargeMs / RAIL_CHARGE_MS;
+    this.railBeams.set(sessionId, {
+      dps: RAIL_MIN_DPS + (RAIL_MAX_DPS - RAIL_MIN_DPS) * c,
+      length: RAIL_MIN_RANGE + (RAIL_MAX_RANGE - RAIL_MIN_RANGE) * c,
+      halfWidth: RAIL_MIN_HALF_WIDTH + (RAIL_MAX_HALF_WIDTH - RAIL_MIN_HALF_WIDTH) * c,
+      digRadius: RAIL_DIG_MIN_R + (RAIL_DIG_MAX_R - RAIL_DIG_MIN_R) * c,
+      // Beam duration follows the charge held, but never exceeds RAIL_MAX_BEAM_MS (so the last stretch
+      // of charge maxes power without also maxing how long the beam lingers).
+      endsAt: Date.now() + Math.min(RAIL_MAX_BEAM_MS, Math.max(RAIL_MIN_BEAM_MS, chargeMs)),
+      lastCarveAt: 0,
+    });
+    vole.railgunCharge = 0;
+    let fireTimes = this.lastFireAt.get(sessionId);
+    if (!fireTimes) {
+      fireTimes = new Map();
+      this.lastFireAt.set(sessionId, fireTimes);
+    }
+    fireTimes.set("railgun", Date.now());
+  }
+
+  /** Clears any railgun charge/beam state for a vole and the synced fields the client renders from.
+   *  Safe to call unconditionally (death, leave, respawn, weapon switch). */
+  private stopRailgun(sessionId: string): void {
+    this.railCharging.delete(sessionId);
+    this.railBeams.delete(sessionId);
+    const vole = this.state.voles.get(sessionId);
+    if (vole) {
+      vole.railgunCharge = 0;
+      vole.railgunBeamActive = false;
+      vole.railgunBeamLength = 0;
+      vole.railgunBeamWidth = 0;
+    }
+  }
+
   /** Adds the always-on dummy bot vole — see BOT_ID's own comment for what it's for. Called once
    *  from onCreate, not onJoin, since it's never a real connected client. */
   private spawnBot(): void {
     const vole = new VoleSchema();
     vole.id = BOT_ID;
     vole.displayName = "Bot";
+    vole.heroId = "burrows"; // the bot always wears the built-in Burrows art
     vole.isBot = true;
     const spawn = this.findClearSpawn();
     vole.x = spawn.x;
@@ -238,9 +437,21 @@ export class GameRoom extends Room<GameState> {
     vole.jumpCooldown = 0;
     vole.coyoteTimer = 0;
     vole.jumpBufferTimer = 0;
+    vole.doubleJumpAvailable = true;
     vole.ropeActive = false;
+    vole.dashCharges = 2;
+    vole.dashRechargeTimer = 0;
+    vole.dashHeld = false;
+    vole.burrowActive = false;
+    vole.burrowElapsed = 0;
+    vole.burrowStartY = 0;
+    vole.burrowCooldownTimer = 0;
+    vole.burrowHeld = false;
+    this.burrowHitVictims.delete(sessionId);
     this.stopFlaming(sessionId);
     this.flameDot.delete(sessionId);
+    this.stopRailgun(sessionId);
+    this.railDot.delete(sessionId);
     this.fallPeakY.delete(sessionId);
     this.fallSpawnGrace.add(sessionId);
     // Reset rather than leave whatever was last received — otherwise a key still held down at the
@@ -298,6 +509,12 @@ export class GameRoom extends Room<GameState> {
     }
     playerFireTimes.set(weapon.id, now);
 
+    // Mine: not thrown — dropped at the vole's exact position, then it falls to the terrain.
+    if (weapon.id === "mine") {
+      this.deployMine(sessionId, vole.x, vole.y, now);
+      return;
+    }
+
     const spawnDist = VOLE_RADIUS + 4;
 
     // Charge-thrown weapons (grenade): the client sends a 0..1 `power` built up while LMB was held.
@@ -307,27 +524,40 @@ export class GameRoom extends Room<GameState> {
         Math.max(0, Math.min(1, power ?? 0)) * ((weapon.maxThrowSpeed ?? 0) - (weapon.minThrowSpeed ?? 0))
       : weapon.projectileSpeed;
 
-    // pelletCount > 1 (shotgun/minigun) fans multiple projectiles out across spreadRadians of random
-    // aim jitter instead of firing one straight shot.
+    // pelletCount > 1 (shotgun) fires a whole volley at once; spreadRadians scatters the aim of every
+    // shot (a wide fan for shotgun, a slight wobble for minigun's rapid single rounds); spawnSpread
+    // offsets each round perpendicular to the aim so minigun's stream is a band, not one flat line.
     const pelletCount = weapon.pelletCount ?? 1;
     const spread = weapon.spreadRadians ?? 0;
+    const spawnSpread = weapon.spawnSpread ?? 0;
+    // A multi-pellet volley leaves from ONE muzzle point (along aimAngle) and only the pellet
+    // VELOCITIES are scattered — so the pattern is tight at point-blank and blooms with distance.
+    // Single-shot weapons spawn along their own (jittered) angle as before.
+    const converge = pelletCount > 1;
+    const muzzleAngle = converge ? vole.aimAngle : null;
     for (let i = 0; i < pelletCount; i++) {
-      const angle = vole.aimAngle + (pelletCount > 1 ? (Math.random() - 0.5) * spread : 0);
+      const angle = vole.aimAngle + (spread > 0 ? (Math.random() - 0.5) * spread : 0);
       const dirX = Math.cos(angle);
       const dirY = Math.sin(angle);
+      // Perpendicular (-dirY, dirX) spawn offset — moves the muzzle point up/down across the aim
+      // line without changing the direction the round travels.
+      const perp = spawnSpread > 0 ? (Math.random() - 0.5) * 2 * spawnSpread : 0;
 
+      const spawnAngle = muzzleAngle ?? angle;
+      const sdx = Math.cos(spawnAngle);
+      const sdy = Math.sin(spawnAngle);
       // Normally the projectile spawns a little ahead of the vole (spawnDist) so it clears its own
       // hitbox. But if there's solid terrain between the vole and that spawn point — i.e. the vole is
       // hugging a wall it's shooting at — spawn it right at the near face of that wall instead, so it
       // carves the wall the player is touching rather than magically appearing on the far side of it.
-      const blocked = raycastTerrain(this.terrain, vole.x, vole.y, angle, spawnDist);
+      const blocked = raycastTerrain(this.terrain, vole.x, vole.y, spawnAngle, spawnDist);
 
       const projectile: ProjectileSimState = {
         id: `p${this.projectileSeq++}`,
         ownerId: sessionId,
         weaponId: weapon.id,
-        x: blocked ? blocked.x : vole.x + dirX * spawnDist,
-        y: blocked ? blocked.y : vole.y + dirY * spawnDist,
+        x: (blocked ? blocked.x : vole.x + sdx * spawnDist) - sdy * perp,
+        y: (blocked ? blocked.y : vole.y + sdy * spawnDist) + sdx * perp,
         vx: dirX * launchSpeed,
         vy: dirY * launchSpeed,
         bounces: 0,
@@ -338,6 +568,30 @@ export class GameRoom extends Room<GameState> {
       // stays in lockstep with the eventual terrain-carve broadcast without per-tick network traffic.
       this.broadcast("fire", projectile);
     }
+    // One volley = one bang. A dedicated event (not per-pellet) so the client plays the shot sound
+    // once; carries ownerId so only the shooter also hears their own reload.
+    if (weapon.id === "shotgun") this.broadcast("shotgun-fire", { ownerId: sessionId });
+  }
+
+  /** Dig ability (see physics.ts DIG_* / resolveDigDirection). Bores one DIG_REACH-long,
+   *  DIG_RADIUS-wide tunnel from the vole along its (slope-clamped) aim — but only if it's genuinely
+   *  pressed against a wall on `intoDir` and actually looking that way. No cooldown; carves nothing
+   *  and costs nothing when the checks fail ("nothing happens"). Own `dig-carve` broadcast, same
+   *  reasoning as burrow-carve (not "terrain-carve", to skip that event's per-impact sound path). */
+  private handleDig(sessionId: string, intoDir: -1 | 1 | 0): void {
+    if (this.state.winnerId || intoDir === 0) return;
+    const vole = this.state.voles.get(sessionId);
+    if (!vole || !vole.alive || vole.burrowActive || vole.ropeActive) return;
+    // Must actually be up against a wall on that side — i.e. a small nudge that way would put the
+    // body into terrain. A full circle test (not a single point) so it matches whatever the walk's
+    // own collision would treat as "blocked", including a wall met at chest height over open floor.
+    if (!circleHitsTerrain(this.terrain, vole.x + intoDir * 2, vole.y, VOLE_RADIUS)) return;
+    const dir = resolveDigDirection(vole.aimAngle, intoDir);
+    if (!dir) return; // looking away from the wall — nothing happens
+    const x2 = vole.x + dir.x * DIG_REACH;
+    const y2 = vole.y + dir.y * DIG_REACH;
+    this.terrain.carveCapsule(vole.x, vole.y, x2, y2, DIG_RADIUS);
+    this.broadcast("dig-carve", { ownerId: sessionId, x: vole.x, y: vole.y, x2, y2, radius: DIG_RADIUS });
   }
 
   private update(): void {
@@ -358,11 +612,29 @@ export class GameRoom extends Room<GameState> {
         jumpCooldown: vole.jumpCooldown,
         coyoteTimer: vole.coyoteTimer,
         jumpBufferTimer: vole.jumpBufferTimer,
+        doubleJumpAvailable: vole.doubleJumpAvailable,
         ropeActive: vole.ropeActive,
         ropeAnchorX: vole.ropeAnchorX,
         ropeAnchorY: vole.ropeAnchorY,
         ropeLength: vole.ropeLength,
+        dashCharges: vole.dashCharges,
+        dashRechargeTimer: vole.dashRechargeTimer,
+        dashHeld: vole.dashHeld,
+        burrowActive: vole.burrowActive,
+        burrowElapsed: vole.burrowElapsed,
+        burrowStartY: vole.burrowStartY,
+        burrowCooldownTimer: vole.burrowCooldownTimer,
+        burrowHeld: vole.burrowHeld,
       };
+      // Captured pre-step so a dash this tick (charge count drops) can be broadcast with the exact
+      // point the vole left from — the client spawns a smoke trail from there to where it lands.
+      const preDashX = sim.x;
+      const preDashY = sim.y;
+      const preDashCharges = sim.dashCharges;
+      // Captured pre-step so the burrow-carve check below (after stepVole mutates sim.burrowActive)
+      // still knows whether this was the activation tick / a mid-burrow tick / the completion or
+      // cancel tick — all four need a carve, only "wasn't and still isn't burrowing" doesn't.
+      const preBurrowActive = sim.burrowActive;
       stepVole(sim, input, this.terrain, DT);
       vole.x = sim.x;
       vole.y = sim.y;
@@ -374,10 +646,40 @@ export class GameRoom extends Room<GameState> {
       vole.jumpCooldown = sim.jumpCooldown;
       vole.coyoteTimer = sim.coyoteTimer;
       vole.jumpBufferTimer = sim.jumpBufferTimer;
+      vole.doubleJumpAvailable = sim.doubleJumpAvailable;
       vole.ropeActive = sim.ropeActive;
       vole.ropeAnchorX = sim.ropeAnchorX;
       vole.ropeAnchorY = sim.ropeAnchorY;
       vole.ropeLength = sim.ropeLength;
+      vole.dashCharges = sim.dashCharges;
+      vole.dashRechargeTimer = sim.dashRechargeTimer;
+      vole.dashHeld = sim.dashHeld;
+      vole.burrowActive = sim.burrowActive;
+      vole.burrowElapsed = sim.burrowElapsed;
+      vole.burrowStartY = sim.burrowStartY;
+      vole.burrowCooldownTimer = sim.burrowCooldownTimer;
+      vole.burrowHeld = sim.burrowHeld;
+      // Burrow destroys terrain as it digs (see BURROW_CARVE_RADIUS) — carve at the vole's new
+      // position on the activation tick, every tick still burrowing, and the completion/cancel tick
+      // (preBurrowActive || sim.burrowActive covers all four; only "never burrowing" is excluded).
+      // Own message (not "terrain-carve") so it doesn't trip that event's per-impact sound/bullet-
+      // resolve path every tick — same reasoning as the railgun's own "railgun-carve".
+      if (preBurrowActive || sim.burrowActive) {
+        this.terrain.carveCircle(sim.x, sim.y, BURROW_CARVE_RADIUS);
+        this.broadcast("burrow-carve", { x: sim.x, y: sim.y, radius: BURROW_CARVE_RADIUS });
+      }
+      // Dash fired this tick — tell clients so they can play the smoke effect (see main.ts's "dash"
+      // handler). from/to spans the blink so the trail matches wherever terrain cut it short.
+      if (sim.dashCharges < preDashCharges) {
+        this.broadcast("dash", {
+          id: sessionId,
+          fromX: preDashX,
+          fromY: preDashY,
+          x: sim.x,
+          y: sim.y,
+          angle: sim.aimAngle,
+        });
+      }
       simVoles.push(sim);
 
       // Fall damage: while genuinely airborne (not on the rope — swinging isn't falling), remember
@@ -404,6 +706,14 @@ export class GameRoom extends Room<GameState> {
       }
     });
 
+    this.updateBurrowContacts(simVoles);
+
+    // Mines are hit-test targets for projectiles too (shooting one detonates it) — feed them into
+    // stepProjectile alongside the voles, tagged so the result can be told apart.
+    const mineTargets: VoleHitTarget[] = [];
+    this.state.mines.forEach((m, id) => mineTargets.push({ id: `mine:${id}`, x: m.x, y: m.y, alive: true }));
+    const projTargets: VoleHitTarget[] = mineTargets.length ? [...simVoles, ...mineTargets] : simVoles;
+
     const remaining: { proj: ProjectileSimState; traveled: number; terrainPierced: number }[] = [];
     for (const item of this.projectiles) {
       const proj = item.proj;
@@ -427,10 +737,16 @@ export class GameRoom extends Room<GameState> {
       // PROJECTILE_OWNER_CLEARANCE) — matters now that a wall-blocked shot spawns right next to them.
       const ignoreOwner = item.traveled < PROJECTILE_OWNER_CLEARANCE ? proj.ownerId : undefined;
       const prevBounces = proj.bounces ?? 0;
-      const result = stepProjectile(proj, effectiveWeapon, this.terrain, DT, simVoles, pierceBudget, ignoreOwner);
+      const result = stepProjectile(proj, effectiveWeapon, this.terrain, DT, projTargets, pierceBudget, ignoreOwner);
       item.traveled += Math.hypot(result.x - prevX, result.y - prevY);
       item.terrainPierced += result.pierceDistance;
       if ((proj.bounces ?? 0) > prevBounces) this.broadcast("grenade-bounce", { x: proj.x, y: proj.y });
+
+      // Hit a mine — detonate it and consume this projectile (the mine's blast is the payload).
+      if (result.hit && result.hit.targetId.startsWith("mine:")) {
+        this.detonateMine(result.hit.targetId.slice(5), proj.ownerId, simVoles);
+        continue;
+      }
 
       // A piercing weapon (sniper) doesn't stop at dirt/stone (see stepProjectile), so it can cover
       // this whole tick's travel distance in one go even through solid material — carve a capsule
@@ -479,6 +795,8 @@ export class GameRoom extends Room<GameState> {
     this.projectiles = remaining;
 
     this.updateFlames(simVoles);
+    this.updateRailgun(simVoles);
+    this.updateMines(simVoles);
 
     this.corpseSim.forEach((sim, id) => {
       stepCorpse(sim, this.terrain, DT);
@@ -489,6 +807,13 @@ export class GameRoom extends Room<GameState> {
         schema.angle = sim.angle;
       }
     });
+
+    // Terrain-remaining figure for the top-centre HUD (see GameState.terrainRemaining). It only
+    // moves when something carves, so a full-grid rescan every 30Hz tick is wasted work — every 6th
+    // tick (5Hz) is plenty responsive for a readout.
+    if (++this.terrainStatTick % 6 === 0) {
+      this.state.terrainRemaining = this.terrain.countDestructible() / this.terrainInitialDestructible;
+    }
   }
 
   /** Spawns a persistent, purely cosmetic corpse at a vole's death position — see memory/CLAUDE.md:
@@ -550,19 +875,30 @@ export class GameRoom extends Room<GameState> {
     vole.flaming = false;
     this.flaming.delete(targetId);
     this.flameDot.delete(targetId);
+    this.stopRailgun(targetId);
+    this.railDot.delete(targetId);
     vole.deaths += 1;
     vole.score -= 1;
     this.spawnCorpse(vole.x, vole.y, vole.aimAngle);
     this.clock.setTimeout(() => this.handleRespawn(targetId), RESPAWN_DELAY_MS);
 
+    let killerName = "";
     if (attackerId !== targetId) {
       const killer = this.state.voles.get(attackerId);
       if (killer) {
         killer.kills += 1;
         killer.score += 1;
+        killerName = killer.displayName;
         if (killer.score >= WIN_SCORE) this.state.winnerId = killer.id;
       }
     }
+    // Top-right kill feed on every client (see main.ts pushKillFeed). No killerName ⇒ an
+    // environmental death or a self-kill (selfKill distinguishes the two for the wording).
+    this.broadcast("kill", {
+      killerName,
+      victimName: vole.displayName,
+      selfKill: attackerId === targetId,
+    });
   }
 
   /**
@@ -666,6 +1002,98 @@ export class GameRoom extends Room<GameState> {
     });
   }
 
+  /**
+   * One tick of railgun resolution (see the RAIL_* constants). Syncs the 0..1 charge meter for
+   * anyone winding one up. For every live beam: raycast from the owner's muzzle along their aim to
+   * the first SOLID cell (terrain BLOCKS the beam now), capped at the charge-scaled range; that's
+   * the beam's front. Sync front distance + half-width for the client renderer, deal DoT
+   * (dps × elapsed, fractional damage carried) to any vole the muzzle→front segment touches, and —
+   * on the RAIL_CARVE_TICK_S cadence — chew a `digRadius` capsule from the OWNER'S position to the
+   * front (so the ground under the player's feet goes too; carveCapsule leaves rock alone, so a
+   * rock front is a permanent stop). Expired beams are dropped.
+   */
+  private updateRailgun(simVoles: VoleSimState[]): void {
+    const now = Date.now();
+
+    this.railCharging.forEach((startedAt, sid) => {
+      const vole = this.state.voles.get(sid);
+      if (!vole || !vole.alive) {
+        this.railCharging.delete(sid);
+        if (vole) vole.railgunCharge = 0;
+        return;
+      }
+      vole.railgunCharge = Math.min(1, (now - startedAt) / RAIL_CHARGE_MS);
+    });
+
+    // victimId -> ownerId for voles touched by a beam this tick, so stale DoT accumulators can be
+    // dropped once a vole steps out of every beam.
+    const beamed = new Map<string, string>();
+
+    this.railBeams.forEach((beam, ownerId) => {
+      const owner = this.state.voles.get(ownerId);
+      if (!owner || !owner.alive || now >= beam.endsAt) {
+        this.railBeams.delete(ownerId);
+        if (owner) {
+          owner.railgunBeamActive = false;
+          owner.railgunBeamLength = 0;
+          owner.railgunBeamWidth = 0;
+        }
+        return;
+      }
+
+      const dirX = Math.cos(owner.aimAngle);
+      const dirY = Math.sin(owner.aimAngle);
+      const mx = owner.x + dirX * RAIL_MUZZLE_DIST;
+      const my = owner.y + dirY * RAIL_MUZZLE_DIST;
+      // Front = first solid cell along the aim (terrain blocks the beam), capped at the beam's reach.
+      const hit = raycastTerrain(this.terrain, mx, my, owner.aimAngle, beam.length);
+      const len = hit ? Math.hypot(hit.x - mx, hit.y - my) : beam.length;
+      const fx = mx + dirX * len;
+      const fy = my + dirY * len;
+
+      owner.railgunBeamActive = true;
+      owner.railgunBeamLength = len;
+      owner.railgunBeamWidth = beam.halfWidth;
+
+      // On the RAIL_CARVE_TICK_S cadence, chew a digRadius bite out of the front. The capsule runs
+      // from the OWNER'S own position (not the offset muzzle) so the terrain the player is standing
+      // on gets cleared too — everything between is open air, so this only removes the footing near
+      // the vole and the digRadius bite at the front. carveCapsule leaves rock alone, so a rock
+      // front just stops the beam. Own message, mirrored 1:1 by the client's terrain.
+      if (now - beam.lastCarveAt >= RAIL_CARVE_TICK_S * 1000) {
+        beam.lastCarveAt = now;
+        this.terrain.carveCapsule(owner.x, owner.y, fx, fy, beam.digRadius);
+        this.broadcast("railgun-carve", { x1: owner.x, y1: owner.y, x2: fx, y2: fy, radius: beam.digRadius });
+      }
+
+      // DoT to any vole whose body touches the beam segment (muzzle → terrain-clipped front).
+      const reach = beam.halfWidth + VOLE_RADIUS;
+      for (const target of simVoles) {
+        if (target.id === ownerId || !target.alive) continue;
+        if (pointSegmentDistance(target.x, target.y, mx, my, fx, fy) > reach) continue;
+        beamed.set(target.id, ownerId);
+        const dot = this.railDot.get(target.id) ?? { acc: 0, carry: 0 };
+        dot.acc += DT;
+        if (dot.acc >= RAIL_DMG_TICK_S) {
+          dot.acc -= RAIL_DMG_TICK_S;
+          dot.carry += beam.dps * RAIL_DMG_TICK_S;
+          const whole = Math.floor(dot.carry);
+          if (whole > 0) {
+            dot.carry -= whole;
+            this.applyDamage(target.id, whole, ownerId, 0, 0, true);
+          }
+        }
+        this.railDot.set(target.id, dot);
+        const tv = this.state.voles.get(target.id);
+        if (tv && !tv.alive) this.railDot.delete(target.id);
+      }
+    });
+
+    this.railDot.forEach((_v, victimId) => {
+      if (!beamed.has(victimId)) this.railDot.delete(victimId);
+    });
+  }
+
   /** Records (or refreshes) a burn patch at (x, y), lit by `ownerId`. Patches close to an existing
    *  one just extend its timer instead of piling up; the list is hard-capped at MAX_BURNS with the
    *  oldest dropped first. Kept in lockstep with state.burns for the client. */
@@ -688,5 +1116,128 @@ export class GameRoom extends Room<GameState> {
     schema.x = x;
     schema.y = y;
     this.state.burns.set(id, schema);
+  }
+
+  /** Drops a mine at (x, y) — it falls to the terrain in update() and arms after MINE_ARM_MS. */
+  private deployMine(ownerId: string, x: number, y: number, now: number): void {
+    if (this.state.mines.size >= MAX_MINES) {
+      const oldest = this.state.mines.keys().next().value as string | undefined;
+      if (oldest) this.removeMine(oldest);
+    }
+    const id = `mine${this.mineSeq++}`;
+    const schema = new MineSchema();
+    schema.id = id;
+    schema.x = x;
+    schema.y = y;
+    schema.ownerId = ownerId;
+    schema.armed = false;
+    this.state.mines.set(id, schema);
+    // If it spawned already touching solid ground, it's grounded straight away.
+    const grounded = circleHitsTerrain(this.terrain, x, y, MINE_RADIUS);
+    this.mineSim.set(id, { vy: 0, grounded, deployedAt: now });
+  }
+
+  private removeMine(id: string): void {
+    this.state.mines.delete(id);
+    this.mineSim.delete(id);
+  }
+
+  /** Blows a mine up: carve + linear-falloff blast (the vole that set it off, if any, takes the full
+   *  `damage`). `attackerId` gets the kill credit. Then the mine is removed. */
+  private detonateMine(id: string, attackerId: string, simVoles: VoleSimState[], triggeredBy?: string): void {
+    const mine = this.state.mines.get(id);
+    if (!mine) return;
+    const x = mine.x;
+    const y = mine.y;
+    this.removeMine(id);
+
+    const weapon = WEAPONS.mine;
+    const directHit = triggeredBy ? { targetId: triggeredBy, part: "body" as const } : null;
+    const { damageEvents } = applyExplosion(this.terrain, x, y, weapon, simVoles, directHit);
+    this.broadcast("terrain-carve", { weaponId: "mine", x, y, radius: weapon.carveRadius });
+    for (const dmg of damageEvents) {
+      this.applyDamage(dmg.targetId, dmg.amount, attackerId, dmg.knockbackX, dmg.knockbackY);
+    }
+  }
+
+  /** One tick of mine physics: fall to the terrain, arm after MINE_ARM_MS, and (once armed and
+   *  landed) detonate on any vole that comes within MINE_TRIGGER_RADIUS. */
+  private updateMines(simVoles: VoleSimState[]): void {
+    const now = Date.now();
+    const triggers: { id: string; ownerId: string; by: string }[] = [];
+
+    this.state.mines.forEach((mine, id) => {
+      const sim = this.mineSim.get(id);
+      if (!sim) return;
+
+      if (!sim.grounded) {
+        sim.vy += GRAVITY * DT;
+        const drop = sim.vy * DT;
+        const steps = Math.max(1, Math.ceil(Math.abs(drop)));
+        let ny = mine.y;
+        for (let s = 0; s < steps; s++) {
+          const step = ny + drop / steps;
+          if (circleHitsTerrain(this.terrain, mine.x, step, MINE_RADIUS)) {
+            sim.grounded = true;
+            sim.vy = 0;
+            break;
+          }
+          ny = step;
+        }
+        mine.y = ny;
+      }
+
+      if (!mine.armed && now - sim.deployedAt >= MINE_ARM_MS) mine.armed = true;
+
+      if (mine.armed && sim.grounded) {
+        const reach = VOLE_RADIUS + MINE_TRIGGER_RADIUS;
+        for (const v of simVoles) {
+          if (!v.alive) continue;
+          const dx = v.x - mine.x;
+          const dy = v.y - mine.y;
+          if (dx * dx + dy * dy <= reach * reach) {
+            triggers.push({ id, ownerId: mine.ownerId, by: v.id });
+            break;
+          }
+        }
+      }
+    });
+
+    for (const t of triggers) this.detonateMine(t.id, t.ownerId, simVoles, t.by);
+  }
+
+  /** One tick of Burrow's contact damage (see BURROW_CONTACT_* — the descent itself is entirely
+   *  handled by stepVole). Any live vole whose body comes within BURROW_CONTACT_RADIUS of a currently
+   *  burrowing vole takes a flat hit + knockback away from it, once per burrow activation (tracked in
+   *  burrowHitVictims, reset the instant that vole stops burrowing). */
+  private updateBurrowContacts(simVoles: VoleSimState[]): void {
+    for (const burrower of simVoles) {
+      if (!burrower.burrowActive) {
+        this.burrowHitVictims.delete(burrower.id);
+        continue;
+      }
+      let victims = this.burrowHitVictims.get(burrower.id);
+      if (!victims) {
+        victims = new Set();
+        this.burrowHitVictims.set(burrower.id, victims);
+      }
+      for (const other of simVoles) {
+        if (other.id === burrower.id || !other.alive || victims.has(other.id)) continue;
+        const dx = other.x - burrower.x;
+        const dy = other.y - burrower.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist > BURROW_CONTACT_RADIUS) continue;
+        victims.add(other.id);
+        const nx = dist > 0.001 ? dx / dist : 1;
+        const ny = dist > 0.001 ? dy / dist : 0;
+        this.applyDamage(
+          other.id,
+          BURROW_CONTACT_DAMAGE,
+          burrower.id,
+          nx * BURROW_CONTACT_KNOCKBACK,
+          ny * BURROW_CONTACT_KNOCKBACK
+        );
+      }
+    }
   }
 }

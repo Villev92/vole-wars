@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>REAPER Render: VoleWars</title>
+<style>
+body { font-family: monospace; }
+table { border-collapse: collapse; }
+table th { border: 1px solid black; padding: 12px; text-align: right; }
+table td { border: 1px solid black; padding: 12px; text-align: right; }
+table th:nth-child(1), td:nth-child(1) { text-align: left; }
+</style>
+</head>
+<body>
+<p>REAPER Render</p>
+<p>
+WAV: 24bit PCM, 44100Hz, 2ch, 2067kbps<br>
+Project: VoleWars<br>
+</p>
+<br>
+<table>
+<thead>
+<tr>
+<th><br>File</th>
+<th><br>Length</th>
+<th><br>Peak</th>
+<th><br>Clips</th>
+<th>max<br>LUFS-M</th>
+<th>max<br>LUFS-S</th>
+<th><br>LUFS-I</th>
+<th><br>LRA</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GrenadeBounce.wav</td>
+<td>0:00.237</td>
+<td>-5.8</td>
+<td>0</td>
+<td>-17.1</td>
+<td>-25.9</td>
+<td>-17.9</td>
+<td>--</td>
+</tr>
+</tbody>
+</table>
+<br><br>
+<input type='checkbox' id='regions' name='regions' value='yes'>
+<label for='regions'> Display project regions</label><br>
+<input type='checkbox' id='markers' name='markers'>
+<label for='markers'> Display project markers</label><br>
+<script type='text/javascript'>
+var w=1024, h=768, xa=64, xb=w-24, ya=32, yb=112, yc=160, yd=h-24;
+const colors=['#808080', '#3366CC', '#FF9900', '#F0F8F0', '#80E080'];
+function stroke(ctx, c, l) { ctx.strokeStyle=c; ctx.lineWidth=l; ctx.stroke(); }
+function strokerect(ctx, c, l, x, y, w, h) { ctx.strokeStyle=c; ctx.lineWidth=l; ctx.strokeRect(x, y, w, h); }
+function fill(ctx, c) { ctx.fillStyle=c; ctx.fill(); }
+function fillrect(ctx, c, x, y, w, h) { ctx.fillStyle=c; ctx.fillRect(x, y, w, h); }
+function text(ctx, c, a, b, t, x, y) { ctx.fillStyle=c; ctx.textAlign=a; ctx.textBaseline=b; ctx.fillText(t, x, y); }
+function clip(ctx, x, y, w, h) { ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip(); }
+function to_x(x) { return xa+(xb-xa)*x; }
+function to_y(y, i) { return !i ? ya+(yb-ya)*y : yc+(yd-yc)*y; }
+function from_x(x) { return (x-xa)/(xb-xa); }
+function draw_chart(canv, data, tipx, tipy) {
+  w=canv.width=Math.max(window.innerWidth-64, 800);
+  xb=w-24;
+  let reg = 'regions' in data && document.getElementById('regions').checked;
+  let mrk = 'markers' in data && document.getElementById('markers').checked;
+  yc=160+40*(reg+mrk);
+  let ctx=canv.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  ctx.font='1em monospace';
+  let x=xa;
+  text(ctx, '#000000', 'left', 'top', 'File: '+data.name, x, 0);
+  x += ctx.measureText('File: '+data.name).width+48;
+  for (let i=1; i < data.series.length; ++i) {
+    fillrect(ctx, colors[i], x, 6, 40, 3);
+    text(ctx, '#000000', 'left', 'top', data.series[i], x+48, 0);
+    x += ctx.measureText(data.series[i]).width+96;
+  }
+  fillrect(ctx, colors[4], x, 6, 40, 3);
+  text(ctx, '#000000', 'left', 'top', data.integrated[0], x+48, 0);
+  x += ctx.measureText(data.integrated[0]).width+96;
+  if ('dynrange' in data) {
+    fillrect(ctx, colors[3], x, 0, 40, 16);
+    text(ctx, '#000000', 'left', 'top', data.dynrange[0], x+48, 0);
+    let ylo=to_y(data.dynrange[1][0], 1), yhi=to_y(data.dynrange[2][0], 1);
+    fillrect(ctx, colors[3], xa, yhi, xb-xa, ylo-yhi);
+  }
+  let y=to_y(data.integrated[1], 1);
+  fillrect(ctx, colors[4], xa, y-1, xb-xa, 2);
+  ctx.beginPath();
+  for (let i=0; i < data.xmaj.length; ++i) {
+    let x=Math.floor(to_x(data.xmaj[i][0]))+0.5;
+    ctx.moveTo(x, ya);
+    ctx.lineTo(x, yb+8);
+    ctx.moveTo(x, yc-8);
+    ctx.lineTo(x+0.5, h);
+    text(ctx, '#000000', 'center', 'middle', data.xmaj[i][1], x, yc-24);
+  }
+  for (let i=0; i < data.ymaj.length; ++i) {
+    let y=Math.floor(to_y(data.ymaj[i][0], 1))+0.5;
+    ctx.moveTo(xa-8, y);
+    ctx.lineTo(w, y);
+    text(ctx, '#000000', 'right', 'middle', data.ymaj[i][1], xa-24, y);
+  }
+  stroke(ctx, '#E0E0E0', 1);
+  ctx.beginPath();
+  for (let i=0; i < data.xmin.length; ++i) {
+    let x=Math.floor(to_x(data.xmin[i]))+0.5;
+    ctx.moveTo(x, ya);
+    ctx.lineTo(x, yb);
+    ctx.moveTo(x, yc);
+    ctx.lineTo(x, h);
+  }
+  for (let i=0; i < data.ymin.length; ++i) {
+    let y=Math.floor(to_y(data.ymin[i], 1))+0.5;
+    ctx.moveTo(xa, y);
+    ctx.lineTo(w-8, y);
+  }
+  stroke(ctx, '#F4F4F4', 1);
+  strokerect(ctx, '#000000', 1, xa+0.5, ya+0.5, xb-xa, yb-ya);
+  for (let i=0; i < data.series.length; ++i) {
+    ctx.beginPath();
+    for (let j=0; j < data.vals.length; ++j) {
+      ctx.lineTo(to_x(data.vals[j][0][0]), to_y(data.vals[j][i+1][0], i));
+    }
+    if (!i) {
+      ctx.lineTo(xb, yb);
+      ctx.lineTo(xa, yb);
+      fill(ctx, colors[0]);
+    }
+    else {
+      stroke(ctx, colors[i], 2);
+    }
+  }
+  let sx=-1, ex=-1;
+  for (let i=0; i <= data.vals.length; ++i) {
+    if (i < data.vals.length && data.vals[i][1][1].startsWith('+')) {
+      ex=to_x(data.vals[i][0][0]);
+      if (sx < 0) sx=ex;
+    }
+    else if (sx >= 0 && ex >= 0) {
+      fillrect(ctx, '#FF0000', sx, ya, ex-sx, yb-ya);
+      sx=ex=-1;
+    }
+  }
+  if (reg) {
+    let lastx=w;
+    for (let i=data.regions.length-1; i >= 0; --i) {
+      let tx=Math.floor(to_x(data.regions[i][0]));
+      let ty=yb+10+0.5;
+      let tw=Math.floor(to_x(data.regions[i][2]))-tx;
+      let ex=tx+tw;
+      if (tx+tw > lastx) tw=lastx-tx;
+      lastx=tx-1;
+      fillrect(ctx, data.regions[i][5], tx, ty, tw, 20);
+      clip(ctx, tx, ty, tw, 20);
+      text(ctx, data.regions[i][6], 'left', 'middle', data.regions[i][4], tx+8, ty+10);
+      ctx.restore();
+      fillrect(ctx, data.regions[i][5], tx, ya-6, 2, yc-ya-32);
+      fillrect(ctx, data.regions[i][5], tx, yc-12, 2, h-yc+12);
+      fillrect(ctx, data.regions[i][5], ex, ya-6, 2, yc-ya-32);
+      fillrect(ctx, data.regions[i][5], ex, yc-12, 2, h-yc+12);
+    }
+  }
+  if (mrk) {
+    let lastx=w;
+    for (let i=data.markers.length-1; i >= 0; --i) {
+      let tx=Math.floor(to_x(data.markers[i][0]));
+      let ty=yb+40*reg+10+0.5;
+      let tw=ctx.measureText(data.markers[i][2]).width+16;
+      if (tx+tw > lastx) tw=lastx-tx;
+      lastx=tx-1;
+      fillrect(ctx, data.markers[i][3], tx, ty, tw, 20);
+      clip(ctx, tx, ty, tw, 20);
+      text(ctx, data.markers[i][4], 'left', 'middle', data.markers[i][2], tx+8, ty+10);
+      ctx.restore();
+      fillrect(ctx, data.markers[i][3], tx, ya-6, 2, yc-ya-32);
+      fillrect(ctx, data.markers[i][3], tx, yc-12, 2, h-yc+12);
+    }
+  }
+  if (tipx >= 0 && tipy >= 0) {
+    let tx=from_x(tipx);
+    let j=0;
+    for (; j < data.vals.length-1; ++j) {
+      if (data.vals[j][0][0] > tx) break;
+    }
+    if (j < data.vals.length-1 && data.vals[j+1][0][0]-tx < tx-data.vals[j][0][0]) ++j;
+    let str=[data.vals[j][0][1], '', '', ''];
+    for (let i=0; i < data.series.length; ++i) {
+      ctx.beginPath();
+      ctx.arc(to_x(data.vals[j][0][0]), to_y(data.vals[j][i+1][0], i), 4, 0, 2*Math.PI, false);
+      fill(ctx, !i ? '#000000' : colors[i]);
+      str[i+1]=data.series[i]+' '+data.vals[j][i+1][1];
+    }
+    let tipw=160, tiph=24*(data.series.length+1)+12;
+    if (tipx < tipw/2+1) tipx=tipw/2+1;
+    else if (tipx > w-tipw/2-1) tipx=w-tipw/2-1;
+    tipy += 96;
+    if (tipy > h-tiph/2-1) tipy=h-tiph/2-1;
+    strokerect(ctx, '#000000', 1, tipx-tipw/2, tipy-tiph/2, tipw, tiph);
+    fillrect(ctx, '#FFFFFF', tipx-tipw/2, tipy-tiph/2, tipw, tiph);
+    tipy -= 24*data.series.length/2;
+    for (let i=0; str[i]; ++i) {
+      text(ctx, !i ? '#000000' : colors[i-1], 'center', 'middle', str[i], tipx, tipy);
+      tipy += 24;
+    }
+  }
+}
+</script>
+<br><br>
+<canvas id='chart_0' width='1024' height='768'></canvas>
+<script type='text/javascript'>
+const data_0={
+  name:'GrenadeBounce.wav',
+  length:0.238,
+  series:['Peak','LUFS-M','LUFS-S'],
+  integrated:['LUFS-I',0.2796,'-17.87'],
+  vals:[
+[[0.0250,'0:00.005'],[0.8962,'-39.36'],[0.5703,'-23.98'],[0.7374,'-27.49']],
+[[0.0500,'0:00.011'],[0.8597,'-34.12'],[0.4999,'-22.50'],[0.7302,'-27.33']],
+[[0.0750,'0:00.017'],[0.7737,'-25.81'],[0.4296,'-21.02'],[0.7229,'-27.18']],
+[[0.1000,'0:00.023'],[0.3679,'-7.97'],[0.3593,'-19.54'],[0.7157,'-27.03']],
+[[0.1250,'0:00.029'],[0.3484,'-7.44'],[0.3208,'-18.74'],[0.7084,'-26.88']],
+[[0.1500,'0:00.035'],[0.2824,'-5.76'],[0.3077,'-18.46'],[0.7012,'-26.72']],
+[[0.1750,'0:00.041'],[0.3032,'-6.28'],[0.2947,'-18.19'],[0.6939,'-26.57']],
+[[0.2000,'0:00.047'],[0.3961,'-8.76'],[0.2816,'-17.91'],[0.6867,'-26.42']],
+[[0.2250,'0:00.053'],[0.3550,'-7.62'],[0.2697,'-17.66'],[0.6794,'-26.27']],
+[[0.2500,'0:00.059'],[0.3968,'-8.78'],[0.2664,'-17.59'],[0.6722,'-26.12']],
+[[0.2750,'0:00.065'],[0.3912,'-8.62'],[0.2631,'-17.53'],[0.6713,'-26.10']],
+[[0.3000,'0:00.071'],[0.4314,'-9.81'],[0.2598,'-17.46'],[0.6705,'-26.08']],
+[[0.3250,'0:00.077'],[0.4238,'-9.58'],[0.2566,'-17.39'],[0.6697,'-26.06']],
+[[0.3500,'0:00.083'],[0.5096,'-12.38'],[0.2546,'-17.35'],[0.6688,'-26.05']],
+[[0.3750,'0:00.089'],[0.5297,'-13.10'],[0.2532,'-17.32'],[0.6680,'-26.03']],
+[[0.4000,'0:00.095'],[0.5440,'-13.64'],[0.2518,'-17.29'],[0.6672,'-26.01']],
+[[0.4250,'0:00.100'],[0.5151,'-12.57'],[0.2505,'-17.26'],[0.6663,'-25.99']],
+[[0.4500,'0:00.106'],[0.6072,'-16.23'],[0.2493,'-17.24'],[0.6655,'-25.98']],
+[[0.4750,'0:00.112'],[0.6538,'-18.43'],[0.2488,'-17.22'],[0.6647,'-25.96']],
+[[0.5000,'0:00.118'],[0.6605,'-18.76'],[0.2483,'-17.21'],[0.6638,'-25.94']],
+[[0.5250,'0:00.124'],[0.6613,'-18.81'],[0.2478,'-17.20'],[0.6637,'-25.94']],
+[[0.5500,'0:00.130'],[0.6922,'-20.47'],[0.2473,'-17.19'],[0.6635,'-25.93']],
+[[0.5750,'0:00.136'],[0.6950,'-20.63'],[0.2470,'-17.19'],[0.6634,'-25.93']],
+[[0.6000,'0:00.142'],[0.7108,'-21.55'],[0.2467,'-17.18'],[0.6632,'-25.93']],
+[[0.6250,'0:00.148'],[0.7652,'-25.17'],[0.2465,'-17.18'],[0.6631,'-25.92']],
+[[0.6500,'0:00.154'],[0.7648,'-25.14'],[0.2463,'-17.17'],[0.6629,'-25.92']],
+[[0.6750,'0:00.160'],[0.7702,'-25.54'],[0.2461,'-17.17'],[0.6628,'-25.92']],
+[[0.7000,'0:00.166'],[0.7472,'-23.89'],[0.2460,'-17.17'],[0.6626,'-25.92']],
+[[0.7250,'0:00.172'],[0.7649,'-25.15'],[0.2459,'-17.16'],[0.6625,'-25.91']],
+[[0.7500,'0:00.178'],[0.7622,'-24.95'],[0.2458,'-17.16'],[0.6623,'-25.91']],
+[[0.7750,'0:00.184'],[0.7655,'-25.19'],[0.2457,'-17.16'],[0.6623,'-25.91']],
+[[0.8000,'0:00.190'],[0.7899,'-27.10'],[0.2456,'-17.16'],[0.6623,'-25.91']],
+[[0.8250,'0:00.195'],[0.7960,'-27.62'],[0.2455,'-17.15'],[0.6623,'-25.91']],
+[[0.8500,'0:00.201'],[0.8110,'-28.94'],[0.2454,'-17.15'],[0.6623,'-25.91']],
+[[0.8750,'0:00.207'],[0.8157,'-29.38'],[0.2453,'-17.15'],[0.6623,'-25.91']],
+[[0.9000,'0:00.213'],[0.8070,'-28.58'],[0.2452,'-17.15'],[0.6623,'-25.91']],
+[[0.9250,'0:00.219'],[0.8175,'-29.55'],[0.2452,'-17.15'],[0.6623,'-25.91']],
+[[0.9500,'0:00.225'],[0.8138,'-29.20'],[0.2452,'-17.15'],[0.6623,'-25.91']],
+[[0.9750,'0:00.231'],[0.8327,'-31.06'],[0.2452,'-17.15'],[0.6623,'-25.91']],
+[[1.0000,'0:00.237'],[0.8323,'-31.02'],[0.2452,'-17.15'],[0.6623,'-25.91']],
+],
+  xmaj:[
+[0.0000,'0:00'],
+[0.4210,'0:00.1'],
+[0.8419,'0:00.2'],
+],
+  xmin:[
+],
+  yrange:[
+-33.00,
+-12.00,
+],
+  ymaj:[
+[0.0000,'-12'],
+[0.1429,'-15'],
+[0.2857,'-18'],
+[0.4286,'-21'],
+[0.5714,'-24'],
+[0.7143,'-27'],
+[0.8571,'-30'],
+[1.0000,'-33'],
+],
+  ymin:[
+0.0476,
+0.0952,
+0.1905,
+0.2381,
+0.3333,
+0.3810,
+0.4762,
+0.5238,
+0.6190,
+0.6667,
+0.7619,
+0.8095,
+0.9048,
+0.9524,
+],
+};
+var canv_0=document.getElementById('chart_0');
+draw_chart(canv_0, data_0, -1, -1);
+canv_0.addEventListener('mousemove', function (evt) { draw_chart(canv_0, data_0, evt.offsetX, evt.offsetY); }, false);
+canv_0.addEventListener('mouseleave', function (evt) { draw_chart(canv_0, data_0, -1, -1); }, false);
+window.addEventListener('resize', function (evt) { draw_chart(canv_0, data_0, -1, -1); }, false);
+document.getElementById('regions').addEventListener('change', function (evt) { draw_chart(canv_0, data_0, -1, -1); }, false);
+document.getElementById('markers').addEventListener('change', function (evt) { draw_chart(canv_0, data_0, -1, -1); }, false);
+</script>
+</body>
+</html>

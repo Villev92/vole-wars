@@ -7,9 +7,15 @@
     "apps/*"
   ],
   "scripts": {
+    "dev": "concurrently -k -n SERVER,CLIENT -c blue,green \"npm run dev:server\" \"npm run dev:client:wait\"",
     "dev:server": "npm run dev -w apps/server",
     "dev:client": "npm run dev -w apps/client",
+    "dev:client:wait": "wait-on tcp:2567 && npm run dev:client",
     "build": "npm run build -w apps/client && npm run build -w apps/server",
     "typecheck": "npm run typecheck -w packages/shared && npm run typecheck -w apps/client && npm run typecheck -w apps/server"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5",
+    "wait-on": "^9.1.0"
   }
 }

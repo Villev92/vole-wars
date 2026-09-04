@@ -7,6 +7,10 @@ const CONE_HALF = WEAPONS.flamethrower.flameConeHalfRadians ?? 0.34;
 const MUZZLE_DIST = VOLE_RADIUS + 4; // matches server FLAME_MUZZLE_DIST
 // Overall visual tightness of the jet — scales its width and blob sizes (not its length).
 const JET_NARROW = 0.8;
+// Burn-patch radius — the SAME value the server uses to decide "is this vole standing in it"
+// (GameRoom BURN_CONTACT_RADIUS). The ground fire is drawn to roughly fill this footprint so the
+// visual and the damage area match.
+const BURN_RADIUS = WEAPONS.flamethrower.burnRadius ?? 4.5;
 
 /** A vole currently spraying flame — pose comes from the client's smoothed render state, not raw
  *  server x/y, so the stream tracks the character as fluidly as the rig does. */
@@ -202,45 +206,47 @@ export class FlameLayer {
   }
 }
 
-/** A low bed of ground fire: a faint heat glow, a fountain of small rising flame blobs (same soft
- *  particle look as the jet, so the two read as the same material), and a few rising sparks. */
+/** A low bed of ground fire sized to fill (roughly) BURN_RADIUS around the marker — so what's drawn
+ *  matches the area the server actually burns you in. Faint heat glow + a fountain of small rising
+ *  flame blobs (same soft particle look as the jet) + a few sparks. */
 function drawGroundFire(g: Graphics, seed: number, time: number): void {
   g.clear();
+  const R = BURN_RADIUS;
 
-  // Faint low heat haze — a few squashed stacked circles for a warm, ground-hugging glow.
-  const gw = 1 + 0.14 * Math.sin(time * 5 + seed);
+  // Faint low heat haze, kept inside R.
+  const gw = 1 + 0.12 * Math.sin(time * 5 + seed);
   for (let k = 0; k < 3; k++) {
-    const r = (7 - k * 2) * gw;
+    const r = R * (1 - k * 0.28) * gw;
     for (let s = -1; s <= 1; s++) {
-      g.circle(s * r * 0.55, 1.6, r * 0.55).fill({ color: k === 2 ? 0xff7d26 : 0xc23c10, alpha: 0.05 });
+      g.circle(s * r * 0.4, 1.4, r * 0.6).fill({ color: k === 2 ? 0xff7d26 : 0xc23c10, alpha: 0.06 });
     }
   }
 
-  // Rising flame blobs — spread across the patch, converging and shrinking as they climb. Kept
-  // low so it reads as burning ground, not a campfire.
-  const N = 20;
+  // Rising flame blobs — spread within ~R, converging and shrinking as they climb, kept low so it
+  // reads as burning ground, not a campfire.
+  const N = 18;
   for (let i = 0; i < N; i++) {
     const r1 = hash(i + seed);
     const r2 = hash(i * 2.3 + seed + 4);
     const r3 = hash(i * 5.1 + seed + 11);
-    const lap = Math.floor(time * 1.8 + r1);
-    const life = fract(time * 1.8 + r1);
-    const H = 6.5 + r2 * 5;
-    const x0 = (r1 - 0.5) * 9;
-    const sway = Math.sin(time * 6 + i * 1.7 + lap * 3) * (0.8 + life * 1.9);
+    const lap = Math.floor(time * 1.9 + r1);
+    const life = fract(time * 1.9 + r1);
+    const H = R * (1.1 + r2 * 0.7);
+    const x0 = (r1 - 0.5) * R * 1.7;
+    const sway = Math.sin(time * 6 + i * 1.7 + lap * 3) * (0.5 + life * 1.2);
     const x = x0 * (1 - life * 0.5) + sway;
-    const y = 1.6 - life * H;
+    const y = 1.4 - life * H;
     const grow = Math.sin(life * Math.PI * 0.9);
     const [col, a] = flameColour(Math.min(1, life * 1.15));
-    softBlob(g, x, y, (1.5 + r3 * 1.1) * grow * (1.2 - life * 0.5), col, a * 1.2);
+    softBlob(g, x, y, (0.9 + r3 * 0.9) * grow * (1.2 - life * 0.5), col, a * 1.3);
   }
 
   // Rising sparks.
   for (let s = 0; s < 3; s++) {
     const t = fract(time * 0.5 + s * 0.33 + seed);
-    const sx = Math.sin(seed * 2.7 + s * 2.1) * 3.4 + Math.sin(time * 4 + s) * 1;
-    const sy = 1.6 - t * 11;
-    const r = 0.5 * (1 - t);
-    if (r > 0.04) g.circle(sx, sy, r).fill({ color: 0xffd889, alpha: 0.45 * (1 - t) });
+    const sx = Math.sin(seed * 2.7 + s * 2.1) * R * 0.7 + Math.sin(time * 4 + s);
+    const sy = 1.4 - t * R * 2.4;
+    const r = 0.45 * (1 - t);
+    if (r > 0.04) g.circle(sx, sy, r).fill({ color: 0xffd889, alpha: 0.4 * (1 - t) });
   }
 }

@@ -43,13 +43,27 @@ export const ENTITY_SCALE = 0.225;
 
 const ART_BASE = "/art/";
 
+export interface PartAnchors {
+  torsoNeck: { x: number; y: number };
+  headNeck: { x: number; y: number };
+  gunShoulder: { x: number; y: number };
+  footSole: { x: number; y: number };
+}
+
 export interface VoleTextures {
   head: Texture;
   helmetTint: Texture;
   torso: Texture;
   gun: Texture;
   foot: Texture;
+  /** Per-hero render overrides. Absent for the built-in Burrows art (the create* helpers fall back
+   *  to the hand-measured module constants below); populated by loadHeroArt() for the slice-built
+   *  heroes, whose parts have their own sizes/anchors (see dev/slice-heroes.py). */
+  scales?: { torso: number; head: number; gun: number; foot: number };
+  anchors?: PartAnchors;
 }
+
+export type HeroId = "burrows" | "bristle" | "moss";
 
 let texturesPromise: Promise<VoleTextures> | null = null;
 
@@ -72,6 +86,43 @@ export function loadVoleTextures(): Promise<VoleTextures> {
     })();
   }
   return texturesPromise;
+}
+
+/**
+ * Loads the rig art for a chosen hero. "burrows" is the hand-tuned built-in set (public/art/*.png +
+ * the module constants below). "bristle"/"moss" are assembled from parts sliced out of their design
+ * sheets by dev/slice-heroes.py into public/art/heroes/<id>/, each carrying its own per-part scale
+ * and anchor in spec.json — those ride along on the returned VoleTextures so the create* helpers
+ * pick them up instead of the Burrows constants. Their headgear is baked into the head art, so
+ * there's no separate team-tint layer (helmetTint is an empty texture).
+ */
+export async function loadHeroArt(heroId: HeroId): Promise<VoleTextures> {
+  if (heroId === "burrows") return loadVoleTextures();
+  const base = `/art/heroes/${heroId}/`;
+  const spec = (await fetch(`${base}spec.json`).then((r) => r.json())) as Record<
+    "torso" | "head" | "gun" | "foot",
+    { scale: number; anchor: { x: number; y: number } }
+  >;
+  const [head, torso, gun, foot] = await Promise.all([
+    Assets.load<Texture>(`${base}head.png`),
+    Assets.load<Texture>(`${base}torso.png`),
+    Assets.load<Texture>(`${base}gun.png`),
+    Assets.load<Texture>(`${base}foot.png`),
+  ]);
+  return {
+    head,
+    torso,
+    gun,
+    foot,
+    helmetTint: Texture.EMPTY,
+    scales: { torso: spec.torso.scale, head: spec.head.scale, gun: spec.gun.scale, foot: spec.foot.scale },
+    anchors: {
+      torsoNeck: spec.torso.anchor,
+      headNeck: spec.head.anchor,
+      gunShoulder: spec.gun.anchor,
+      footSole: spec.foot.anchor,
+    },
+  };
 }
 
 const TORSO_SCALE = 0.033;
@@ -118,24 +169,29 @@ export const GUN_SHOULDER_OFFSET = { x: -2.8, y: 5.6 } as const;
  * the Sprite — same reasoning as createFoot's wrapper.
  */
 export function createTorso(textures: VoleTextures): Container {
+  const anchor = textures.anchors?.torsoNeck ?? TORSO_NECK_ANCHOR;
   const sprite = new Sprite(textures.torso);
-  sprite.anchor.set(TORSO_NECK_ANCHOR.x, TORSO_NECK_ANCHOR.y);
-  sprite.scale.set(TORSO_SCALE);
+  sprite.anchor.set(anchor.x, anchor.y);
+  sprite.scale.set(textures.scales?.torso ?? TORSO_SCALE);
   const container = new Container();
   container.addChild(sprite);
   return container;
 }
 
-/** Head + team-tinted helmet overlay, nudged down/forward from O by HEAD_OFFSET so it sits into the torso's neck. */
+/** Head + team-tinted helmet overlay, nudged down/forward from O by HEAD_OFFSET so it sits into the
+ *  torso's neck. Sliced heroes bake their headgear into the head art and pass Texture.EMPTY for the
+ *  tint layer, so the helmet sprite there just renders nothing. */
 export function createHead(textures: VoleTextures, teamColor: number): Container {
+  const anchor = textures.anchors?.headNeck ?? HEAD_NECK_ANCHOR;
+  const scale = textures.scales?.head ?? HEAD_SCALE;
   const base = new Sprite(textures.head);
-  base.anchor.set(HEAD_NECK_ANCHOR.x, HEAD_NECK_ANCHOR.y);
-  base.scale.set(HEAD_SCALE);
+  base.anchor.set(anchor.x, anchor.y);
+  base.scale.set(scale);
   base.position.set(HEAD_OFFSET.x, HEAD_OFFSET.y);
 
   const helmet = new Sprite(textures.helmetTint);
-  helmet.anchor.set(HEAD_NECK_ANCHOR.x, HEAD_NECK_ANCHOR.y);
-  helmet.scale.set(HEAD_SCALE);
+  helmet.anchor.set(anchor.x, anchor.y);
+  helmet.scale.set(scale);
   helmet.position.set(HEAD_OFFSET.x, HEAD_OFFSET.y);
   helmet.tint = teamColor;
 
@@ -153,9 +209,10 @@ export function createHead(textures: VoleTextures, teamColor: number): Container
  * near/far depth offset) — those don't need precision, just to look right.
  */
 export function createFoot(textures: VoleTextures, spreadX: number, spreadY = 0): Container {
+  const anchor = textures.anchors?.footSole ?? FOOT_SOLE_ANCHOR;
   const sprite = new Sprite(textures.foot);
-  sprite.anchor.set(FOOT_SOLE_ANCHOR.x, FOOT_SOLE_ANCHOR.y);
-  sprite.scale.set(FOOT_SCALE);
+  sprite.anchor.set(anchor.x, anchor.y);
+  sprite.scale.set(textures.scales?.foot ?? FOOT_SCALE);
   sprite.position.set(HIP_X + spreadX, FOOT_GROUND_Y + spreadY);
   const container = new Container();
   container.addChild(sprite);
@@ -168,9 +225,10 @@ export function createFoot(textures: VoleTextures, spreadX: number, spreadY = 0)
  * and scale on this every frame, which must compose with (not overwrite) the baked GUN_SCALE.
  */
 export function createGun(textures: VoleTextures): Container {
+  const anchor = textures.anchors?.gunShoulder ?? GUN_SHOULDER_ANCHOR;
   const sprite = new Sprite(textures.gun);
-  sprite.anchor.set(GUN_SHOULDER_ANCHOR.x, GUN_SHOULDER_ANCHOR.y);
-  sprite.scale.set(GUN_SCALE);
+  sprite.anchor.set(anchor.x, anchor.y);
+  sprite.scale.set(textures.scales?.gun ?? GUN_SCALE);
   const container = new Container();
   container.addChild(sprite);
   return container;
@@ -200,4 +258,11 @@ export function setGunVisual(gunContainer: Container, visual: HeldWeaponVisual |
     sprite.anchor.set(visual.anchorX, visual.anchorY);
     sprite.scale.set(visual.scale);
   }
+}
+
+/** Tints the held-weapon sprite (0xffffff = untinted). Only the minigun uses this, to glow the
+ *  barrel red as it heats up — see main.ts's overheat block. Reaches into the same one child
+ *  setGunVisual does. */
+export function setGunTint(gunContainer: Container, tint: number): void {
+  (gunContainer.children[0] as Sprite).tint = tint;
 }
