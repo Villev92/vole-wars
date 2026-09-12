@@ -95,7 +95,7 @@ az role assignment create --assignee "$appId" --role Contributor \
 az ad app federated-credential create --id "$appId" --parameters '{
   "name": "github-main-branch",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:Villev92/vole-wars:ref:refs/heads/main",
+  "subject": "repo:Villev92@23382290/vole-wars@1343962841:ref:refs/heads/main",
   "audiences": ["api://AzureADTokenExchange"]
 }'
 ```
@@ -107,6 +107,14 @@ Colyseus needs.
 path, which corrupts `--scope /subscriptions/...` into garbage like `/C:/Program Files/Git/subscriptions/...`
 and makes `az role assignment create` fail with a cryptic `MissingSubscription` error. Prefix the
 command with `MSYS_NO_PATHCONV=1` when running these from Git Bash.
+
+**Federated credential subject format:** this repo's OIDC subject claims include GitHub's
+immutable owner/repo IDs (`repo:Villev92@23382290/vole-wars@1343962841:ref:refs/heads/main`), not
+just the plain `repo:Villev92/vole-wars:ref:refs/heads/main` most docs show — GitHub added this to
+survive repo renames/transfers without letting an old subject get reused. If the subject ever
+looks wrong (login fails with `AADSTS700213: No matching federated identity record found`), check
+the actual `sub` claim GitHub sent in the failed run's error message and update the federated
+credential to match it exactly, rather than assuming the classic format.
 
 ### GitHub repo secrets
 
