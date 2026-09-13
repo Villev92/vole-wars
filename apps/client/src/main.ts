@@ -28,7 +28,6 @@ import {
   drawMineBullet,
   drawMineImpactFlash,
   drawMinigunBullet,
-  drawMissileBullet,
   drawRailgunBullet,
   drawRailgunImpactFlash,
   drawShotgunPellet,
@@ -41,6 +40,7 @@ import { RailgunLayer, type RailBeamView, type RailChargeView } from "./railgun.
 import { GrenadeAimGuide } from "./grenadeAim.js";
 import { DamageNumberLayer } from "./damageNumbers.js";
 import { MineLayer, type MineView } from "./mines.js";
+import { MissileLayer, type MissileView } from "./missiles.js";
 import { ExplosionLayer } from "./explosions.js";
 import { Minimap, type MinimapVole } from "./minimap.js";
 import {
@@ -163,9 +163,10 @@ const HELD_WEAPON_VISUALS: Record<TexturedWeaponId, { anchorX: number; anchorY: 
 };
 
 // Per-weapon flight/impact visuals for the "fire" broadcast below — falls back to the bazooka's own
-// plain rocket art + the default orange flash for any weapon without its own entry (every
-// WEAPON_IDS slot has one now — see weapons.ts — so this fallback is currently unreachable, kept as
-// a safety net).
+// plain rocket art + the default orange flash for any weapon without its own entry. Every WEAPON_IDS
+// slot that flies as a client-re-simulated bullet has one; the guided missile is deliberately absent
+// — it never sends a "fire" broadcast (its position is streamed and MissileLayer renders it), so
+// this fallback stays unreachable in practice, kept as a safety net.
 const BULLET_VISUALS: Partial<Record<string, { draw: (g: Graphics) => void; impact: (g: Graphics, t: number) => void }>> = {
   ak47: { draw: drawAkBullet, impact: drawImpactFlash },
   sniper: { draw: drawSniperBullet, impact: drawImpactFlash },
@@ -176,7 +177,6 @@ const BULLET_VISUALS: Partial<Record<string, { draw: (g: Graphics) => void; impa
   shotgun: { draw: drawShotgunPellet, impact: drawImpactFlash },
   minigun: { draw: drawMinigunBullet, impact: drawImpactFlash },
   mine: { draw: drawMineBullet, impact: drawMineImpactFlash },
-  missile: { draw: drawMissileBullet, impact: drawImpactFlash },
 };
 const DEFAULT_BULLET_VISUAL = { draw: drawBullet, impact: drawImpactFlash };
 
@@ -653,6 +653,14 @@ async function main(): Promise<void> {
   // the same terrain-unit space the terrain sprite already renders in.
   const entityScale = ENTITY_SCALE;
 
+  // Guided missile (see weapons.ts `missile`): while the local player has one in the air, the camera
+  // follows it instead of their vole and the aim is measured from it (so steering with the mouse
+  // feels direct). `followMissileId` is that missile's id (set/cleared by the state.missiles
+  // add/remove callbacks); `camOverride` is the world point applyCamera should centre on this frame,
+  // recomputed in the ticker once the missile's smoothed render position is known.
+  let followMissileId: string | null = null;
+  let camOverride: { x: number; y: number } | null = null;
+
   const voleViews = new Map<string, VoleView>();
   // The one place allegiance colour is decided (see HELMET_SELF/HELMET_ENEMY). When team deathmatch
   // lands, add: `else if (sameTeam(sessionId, room.sessionId)) return HELMET_ALLY;` here.
@@ -1052,6 +1060,7 @@ async function main(): Promise<void> {
   const grenadeGuide = new GrenadeAimGuide(world);
   const damageNumbers = new DamageNumberLayer(world);
   const mineLayer = new MineLayer(world, weaponIconTextures.mine);
+  const missileLayer = new MissileLayer(world);
   const explosionLayer = new ExplosionLayer(world);
 
   // Bottom-right minimap: whole-map terrain raster + a dot per live player + a white rectangle for
@@ -1073,9 +1082,11 @@ async function main(): Promise<void> {
     const scale = coverScale * renderZoom;
     world.scale.set(scale);
 
+    // While the local player is piloting a missile, centre on it instead of their vole (see
+    // followMissileId / the ticker's camOverride block); otherwise track the vole as usual.
     const selfView = voleViews.get(room.sessionId);
-    const targetX = selfView ? selfView.renderX : terrain.width / 2;
-    const targetY = selfView ? selfView.renderY : terrain.height / 2;
+    const targetX = camOverride ? camOverride.x : selfView ? selfView.renderX : terrain.width / 2;
+    const targetY = camOverride ? camOverride.y : selfView ? selfView.renderY : terrain.height / 2;
     // Deadzone-then-ease follow (see CAM_* constants): the focus only moves once the vole leaves a
     // small box around it, then glides after it — so tiny vertical jitter never scrolls the world.
     if (Number.isNaN(camFocusX)) {
@@ -1145,6 +1156,9 @@ async function main(): Promise<void> {
       if (msg.weaponId === "grenade" || msg.weaponId === "mine") {
         explosionLayer.spawn(msg.x, msg.y, msg.radius, msg.weaponId);
       }
+      // The guided missile has no client-side bullet either — MissileLayer plays the bazooka's own
+      // impact animation at the detonation point the server reports here.
+      if (msg.weaponId === "missile") missileLayer.explode(msg.x, msg.y, entityScale);
     }
     // At most one impact sound per bullet — see soundedProjectileIds' own comment above. A message
     // with no id (shouldn't happen now that both server broadcast sites send one, but harmless if
@@ -1152,7 +1166,7 @@ async function main(): Promise<void> {
     // blast instead of the generic synthesized crack+thump every other weapon still uses.
     if (msg.id === undefined || !soundedProjectileIds.has(msg.id)) {
       if (msg.id !== undefined) soundedProjectileIds.add(msg.id);
-      if (msg.weaponId === "bazooka") playBazookaExplosion();
+      if (msg.weaponId === "bazooka" || msg.weaponId === "missile") playBazookaExplosion();
       else if (msg.weaponId === "grenade" || msg.weaponId === "mine") playGrenadeExplosion();
       else playTerrainImpact();
     }
@@ -1206,6 +1220,10 @@ async function main(): Promise<void> {
     if (msg.weaponId === "sniper") playSniperShot();
     if (msg.weaponId === "bazooka") playBazookaFire();
   });
+
+  // Guided missile launched (see GameRoom.launchMissile) — everyone hears the same rocket-out sound
+  // the bazooka uses. The missile itself is rendered from state.missiles by MissileLayer (below).
+  room.onMessage("missile-fire", (_msg: { ownerId: string }) => playBazookaFire());
 
   // One per shotgun volley (not per pellet). Everyone hears the bang; the shooter also hears the
   // pump-action reload that runs during the post-shot cooldown, staggered just after the bang.
@@ -1296,9 +1314,25 @@ async function main(): Promise<void> {
   $(room.state).mines.onAdd((mine) => mineLayer.add(mine.id, mine.x, mine.y));
   $(room.state).mines.onRemove((mine) => mineLayer.remove(mine.id));
 
+  // Only the local player's own missile takes over the camera / aim origin (see followMissileId).
+  // If they somehow have two in the air, the newest one wins the follow.
+  $(room.state).missiles.onAdd((missile) => {
+    if (missile.ownerId === room.sessionId) followMissileId = missile.id;
+  });
+  $(room.state).missiles.onRemove((missile) => {
+    if (followMissileId === missile.id) followMissileId = null;
+  });
+
   const input = new InputTracker(
     app.canvas,
     () => {
+      // While piloting a missile, aim is measured from the missile (which the camera is centred on),
+      // so the cursor's screen position maps straight to a steering direction. The server reads the
+      // same aimAngle to turn the missile (see GameRoom.updateMissiles).
+      if (followMissileId) {
+        const p = missileLayer.renderPos(followMissileId);
+        if (p) return p;
+      }
       const self = room.state.voles.get(room.sessionId);
       return self ? { x: self.x, y: self.y } : null;
     },
@@ -1622,6 +1656,21 @@ async function main(): Promise<void> {
     });
     bulletLayer.update(dt, entityScale, bulletVoles);
     mineLayer.update(time, mineViews);
+
+    // Guided missiles — streamed from the server (state.missiles), rendered + blast-animated by
+    // MissileLayer. Once its smoothed render pose is updated, point the camera at the local player's
+    // own missile (camOverride, consumed by applyCamera below) for as long as it's in the air.
+    const missileViews: MissileView[] = [];
+    room.state.missiles.forEach((m: { id: string; x: number; y: number; angle: number }) => {
+      missileViews.push({ id: m.id, x: m.x, y: m.y, angle: m.angle });
+    });
+    missileLayer.update(dt, entityScale, missileViews);
+    camOverride = null;
+    if (followMissileId) {
+      const p = missileLayer.renderPos(followMissileId);
+      if (p) camOverride = p;
+    }
+
     particleLayer.update(dt, entityScale);
     explosionLayer.update(dt);
     bloodRenderer.update(dt);

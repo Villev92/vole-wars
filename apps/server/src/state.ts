@@ -91,11 +91,25 @@ export class MineSchema extends Schema {
   @type("boolean") armed = false;
 }
 
+/** A guided missile in flight (see weapons.ts `missile` / GameRoom.updateMissiles). Unlike every
+ *  other projectile its position is streamed to clients (guidance isn't deterministic from the
+ *  launch state, so the client can't re-simulate it) — the client's MissileLayer renders the rocket
+ *  from x/y/angle and the local player's camera follows their own missile until it detonates.
+ *  `angle` is the current heading, for the sprite's rotation. Removed from the map on detonation. */
+export class MissileSchema extends Schema {
+  @type("string") id = "";
+  @type("string") ownerId = "";
+  @type("number") x = 0;
+  @type("number") y = 0;
+  @type("number") angle = 0;
+}
+
 export class GameState extends Schema {
   @type({ map: VoleSchema }) voles = new MapSchema<VoleSchema>();
   @type({ map: CorpseSchema }) corpses = new MapSchema<CorpseSchema>();
   @type({ map: BurnSchema }) burns = new MapSchema<BurnSchema>();
   @type({ map: MineSchema }) mines = new MapSchema<MineSchema>();
+  @type({ map: MissileSchema }) missiles = new MapSchema<MissileSchema>();
   /** Empty until a player reaches the deathmatch win threshold; once set, the match is frozen. */
   @type("string") winnerId = "";
   /** Fraction (0..1) of the originally-generated destructible terrain (DIRT + STONE, not the

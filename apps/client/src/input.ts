@@ -142,7 +142,10 @@ export class InputTracker {
       right: this.right,
       jump: this.jump,
       aimAngle: this.aimAngle,
-      fire: false,
+      // The one-shot fire edge is delivered via onFire() above, not this snapshot — this field
+      // just reports whether LMB is currently held, which the server only uses to double a guided
+      // missile's speed mid-flight (see GameRoom.updateMissiles / PlayerInput.fire).
+      fire: this.fireHeld,
       grapple: this.grapple,
       up: this.up,
       down: this.down,

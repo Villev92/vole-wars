@@ -13,6 +13,10 @@ export interface PlayerInput {
   right: boolean;
   jump: boolean;
   aimAngle: number;
+  /** Left mouse button currently held. Every one-shot weapon fires off a dedicated `fire` message
+   *  instead (and the held-fire weapons — flamethrower/grenade/minigun/railgun — have their own hold
+   *  messages), so the only thing that reads this on the server is the guided missile: while its
+   *  owner holds LMB in flight it travels at double speed (see GameRoom.updateMissiles). */
   fire: boolean;
   /** Right mouse button held — casts/holds the grapple rope. */
   grapple: boolean;

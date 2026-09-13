@@ -19,7 +19,7 @@ when that's needed.
 | Resource | Name | Region | Subscription |
 |---|---|---|---|
 | Resource group | `vole-wars-rg` | Sweden Central | `Azure subscription 1` (`ef0b9e2e-81d6-4b7d-a464-0c9d0026e87e`, tenant `dec42c2a-8e93-44ee-9a1c-03905ff1e6da`, account `ville.vainio92@outlook.com`) |
-| Static Web App | `vole-wars-client` | West Europe (only supported region closest to Sweden Central; SWA serves from a global CDN regardless) | same |
+| Static Web App | `vole-wars-client`, hostname `polite-stone-0afe85603.3.azurestaticapps.net` | West Europe (only supported region closest to Sweden Central; SWA serves from a global CDN regardless) | same |
 | Container Apps environment | `vole-wars-env` | Sweden Central | same |
 | Container App (server) | `vole-wars-server`, FQDN `vole-wars-server.gentlemoss-eacdcb24.swedencentral.azurecontainerapps.io` | Sweden Central | same |
 | Deployer app registration (OIDC) | `vole-wars-deployer`, app/client id `b9f6cf3e-5c24-4486-b006-b111daadfb84` | — | same |

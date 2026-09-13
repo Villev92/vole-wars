@@ -133,7 +133,7 @@ const AK47_MAX_RANGE = 300;
  *  bazooka       260  (maxRange)      1.1  s         ~0.9 /s    30 / — (+20 splash)      16   / 48                lobbed arc (gravityScale 0.6)
  *  grenade       240  (maxRange)      1.0  s         ~1.0 /s    40 / 40  (linear falloff)15   / 44                HELD charge-throw (speed 22–180), 1 bounce
  *  mine          —    (dropped)       1.2  s         ~0.8 /s    30 / —  (linear falloff) 12   / 30                arms after 5 s, 0.5 u proximity, shootable
- *  missile       340  (maxRange)      1.3  s         ~0.8 /s    60 / 120                 14   / 40                lobbed arc (gravityScale 0.35)
+ *  missile       340  (maxRange)      1.3  s         ~0.8 /s    60 / 120                 14   / 40                GUIDED: mouse-steered in flight, hold LMB = 2x speed, launches at 20% speed, gravityScale 0
  *  sniper        600  (maxRange)      1.4  s         ~0.7 /s    50 / 50                  3.5  / 6                 piercing (≤200 u travel, ≤50 u terrain)
  *  railgun       12–75  (by charge)   0.5  s         hold-fire  1–30 /s (by charge)      digs at the front       HELD 4s charge → blue beam (≤4s); terrain BLOCKS it, it bores through
  *  flamethrower   28  (flameRange)    0    (held)    —          5 /0.5s direct, 3 /0.5s burn patch  — (no carve)  HELD stream, 10 s max per squeeze
@@ -327,10 +327,18 @@ export const WEAPONS: Record<string, WeaponDef> = {
   },
   missile: {
     id: "missile",
-    // Heavier ordnance than bazooka: faster and flies flatter (less gravityScale), with a bigger
-    // blast and more damage — a straightforward upgrade tier rather than a new niche.
-    projectileSpeed: 520,
-    gravityScale: 0.35,
+    // Guided missile — the one projectile the player keeps steering after it leaves the tube. It
+    // launches SLOW (projectileSpeed is 20% of the ~520 a rocket like this would normally leave at)
+    // and each server tick the owner's live aimAngle turns its heading (capped at MISSILE_TURN_RATE
+    // — see GameRoom.updateMissiles); while that player holds LMB (PlayerInput.fire) its speed is
+    // doubled (MISSILE_BOOST_MULTIPLIER). The client camera follows it from launch until it
+    // detonates — on the first vole/terrain contact OR on running out of maxRange — always with the
+    // bazooka's own explosion art + sound. gravityScale 0 so the pilot, not gravity, owns the arc.
+    // Unlike every other projectile it is NOT re-simulated by the client BulletLayer (guidance
+    // isn't deterministic from the spawn state): its position is streamed via GameState.missiles
+    // and drawn by the client's MissileLayer.
+    projectileSpeed: 104,
+    gravityScale: 0,
     explosionRadius: 40,
     carveRadius: 14,
     damage: 60,

@@ -22,10 +22,11 @@ import {
   type CorpseSimState,
   type PlayerInput,
   type ProjectileSimState,
+  type VoleHit,
   type VoleHitTarget,
   type VoleSimState,
 } from "@vole-wars/shared";
-import { BurnSchema, CorpseSchema, GameState, MineSchema, VoleSchema } from "./state.js";
+import { BurnSchema, CorpseSchema, GameState, MineSchema, MissileSchema, VoleSchema } from "./state.js";
 
 const TICK_RATE = SIM_TICK_RATE;
 const DT = SIM_DT;
@@ -125,6 +126,16 @@ const BURROW_CONTACT_KNOCKBACK = 260; // matches applyExplosion's own knockback 
 // swept — the steps are already closer together than the radius.
 const BURROW_CARVE_RADIUS = 5.4; // was 6, narrowed to 90% of that at the user's request
 
+// --- Missile (guided — see weapons.ts `missile` def) -----------------------------------------------
+// After launch the missile keeps flying under its owner's control: each tick its heading turns
+// toward that player's current aimAngle, by at most MISSILE_TURN_RATE radians per second (so it
+// arcs around rather than snapping to the cursor), and while they hold LMB (PlayerInput.fire) it
+// travels at MISSILE_BOOST_MULTIPLIER × its base speed. It detonates on the first vole/terrain
+// contact or when it runs out of maxRange, with the bazooka's explosion (same terrain-carve
+// weaponId path the client keys the bazooka blast art + sound off).
+const MISSILE_TURN_RATE = 3.5; // rad/s the guided missile can swing its heading toward the pilot's aim
+const MISSILE_BOOST_MULTIPLIER = 2; // held-LMB speed multiplier while in flight
+
 // --- Mines (see weapons.ts mine def) ----------------------------------------------------------------
 const MINE_ARM_MS = 5_000; // no proximity damage for this long after being dropped
 const MINE_TRIGGER_RADIUS = 0.5; // a vole whose body comes this close to an armed mine sets it off
@@ -202,6 +213,11 @@ export class GameRoom extends Room<GameState> {
   // timer), keyed the same as the synced MineSchema map.
   private mineSim = new Map<string, { vy: number; grounded: boolean; deployedAt: number }>();
   private mineSeq = 0;
+  // Server-only guided-missile state (velocity + path length flown for the maxRange cutoff), keyed
+  // the same as the synced MissileSchema map. The schema syncs only x/y/angle for rendering; this
+  // holds the rest of the simulation (same split as projectiles/ProjectileSimState).
+  private missileSim = new Map<string, { vx: number; vy: number; traveled: number }>();
+  private missileSeq = 0;
   // Fall-damage tracking: the highest point (smallest y) a vole has reached while airborne since it
   // last left the ground. On landing, the drop from that peak is turned into damage (see
   // FALL_MIN_FRACTION / update). fallSpawnGrace skips the first landing after a (re)spawn so the
@@ -515,6 +531,13 @@ export class GameRoom extends Room<GameState> {
       return;
     }
 
+    // Missile: a guided projectile, not a fire-and-forget one — spawn it into state.missiles and
+    // let updateMissiles fly it under the owner's control from here (see launchMissile).
+    if (weapon.id === "missile") {
+      this.launchMissile(sessionId, vole);
+      return;
+    }
+
     const spawnDist = VOLE_RADIUS + 4;
 
     // Charge-thrown weapons (grenade): the client sends a 0..1 `power` built up while LMB was held.
@@ -797,6 +820,7 @@ export class GameRoom extends Room<GameState> {
     this.updateFlames(simVoles);
     this.updateRailgun(simVoles);
     this.updateMines(simVoles);
+    this.updateMissiles(simVoles);
 
     this.corpseSim.forEach((sim, id) => {
       stepCorpse(sim, this.terrain, DT);
@@ -1204,6 +1228,111 @@ export class GameRoom extends Room<GameState> {
     });
 
     for (const t of triggers) this.detonateMine(t.id, t.ownerId, simVoles, t.by);
+  }
+
+  /** Launches a guided missile from `vole` along its current aim (see weapons.ts `missile`). From
+   *  here updateMissiles flies it every tick under the owner's control. Spawns a little ahead of the
+   *  vole like a normal projectile, or right at the near face of a wall it's hugging. */
+  private launchMissile(ownerId: string, vole: VoleSchema): void {
+    const weapon = WEAPONS.missile;
+    const spawnDist = VOLE_RADIUS + 4;
+    const angle = vole.aimAngle;
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const blocked = raycastTerrain(this.terrain, vole.x, vole.y, angle, spawnDist);
+    const id = `m${this.missileSeq++}`;
+    const schema = new MissileSchema();
+    schema.id = id;
+    schema.ownerId = ownerId;
+    schema.x = blocked ? blocked.x : vole.x + dirX * spawnDist;
+    schema.y = blocked ? blocked.y : vole.y + dirY * spawnDist;
+    schema.angle = angle;
+    this.state.missiles.set(id, schema);
+    this.missileSim.set(id, {
+      vx: dirX * weapon.projectileSpeed,
+      vy: dirY * weapon.projectileSpeed,
+      traveled: 0,
+    });
+    // Everyone hears the launch (same recorded rocket-out sound the bazooka uses).
+    this.broadcast("missile-fire", { ownerId });
+  }
+
+  private removeMissile(id: string): void {
+    this.state.missiles.delete(id);
+    this.missileSim.delete(id);
+  }
+
+  /**
+   * One tick of guided-missile flight (see MISSILE_* constants / weapons.ts `missile`). For every
+   * missile in the air: turn its heading toward its owner's live aimAngle (capped at
+   * MISSILE_TURN_RATE), double its speed while that owner holds LMB, then sweep it forward with the
+   * shared stepProjectile (terrain + direct vole hits, gravityScale 0). It detonates on the first
+   * contact or on running out of maxRange — either way an explosion identical to the bazooka's,
+   * announced by a `terrain-carve` broadcast tagged weaponId "missile". A missile whose owner has
+   * left / died just flies straight (no steering, no boost) until it hits something or fizzles.
+   */
+  private updateMissiles(simVoles: VoleSimState[]): void {
+    if (this.state.missiles.size === 0) return;
+    const weapon = WEAPONS.missile;
+    const detonations: { id: string; x: number; y: number; hit: VoleHit | null; ownerId: string }[] = [];
+
+    this.state.missiles.forEach((missile, id) => {
+      const sim = this.missileSim.get(id);
+      if (!sim) {
+        this.state.missiles.delete(id);
+        return;
+      }
+
+      const owner = this.state.voles.get(missile.ownerId);
+      const input = this.inputs.get(missile.ownerId);
+      const piloting = !!owner && owner.alive && !!input;
+
+      let heading = Math.atan2(sim.vy, sim.vx);
+      let speed = weapon.projectileSpeed;
+      if (piloting) {
+        // Shortest signed angle from the current heading to where the pilot is aiming.
+        const delta = Math.atan2(Math.sin(input!.aimAngle - heading), Math.cos(input!.aimAngle - heading));
+        const maxTurn = MISSILE_TURN_RATE * DT;
+        heading += Math.max(-maxTurn, Math.min(maxTurn, delta));
+        if (input!.fire) speed *= MISSILE_BOOST_MULTIPLIER;
+      }
+      sim.vx = Math.cos(heading) * speed;
+      sim.vy = Math.sin(heading) * speed;
+
+      const proj: ProjectileSimState = {
+        id,
+        ownerId: missile.ownerId,
+        weaponId: weapon.id,
+        x: missile.x,
+        y: missile.y,
+        vx: sim.vx,
+        vy: sim.vy,
+      };
+      // Don't let a missile aimed back at the launcher detonate on them coming out of the tube.
+      const ignoreOwner = sim.traveled < PROJECTILE_OWNER_CLEARANCE ? missile.ownerId : undefined;
+      const result = stepProjectile(proj, weapon, this.terrain, DT, simVoles, Infinity, ignoreOwner);
+      sim.traveled += Math.hypot(result.x - missile.x, result.y - missile.y);
+      missile.x = proj.x;
+      missile.y = proj.y;
+      missile.angle = heading;
+      sim.vx = proj.vx;
+      sim.vy = proj.vy;
+
+      const outOfBounds = !this.terrain.inBounds(Math.floor(missile.x), Math.floor(missile.y));
+      const outOfRange = !result.exploded && sim.traveled >= (weapon.maxRange ?? Infinity);
+      if (result.exploded || outOfBounds || outOfRange) {
+        detonations.push({ id, x: result.x, y: result.y, hit: result.hit, ownerId: missile.ownerId });
+      }
+    });
+
+    for (const d of detonations) {
+      this.removeMissile(d.id);
+      const { damageEvents } = applyExplosion(this.terrain, d.x, d.y, weapon, simVoles, d.hit);
+      this.broadcast("terrain-carve", { id: d.id, weaponId: weapon.id, x: d.x, y: d.y, radius: weapon.carveRadius });
+      for (const dmg of damageEvents) {
+        this.applyDamage(dmg.targetId, dmg.amount, d.ownerId, dmg.knockbackX, dmg.knockbackY);
+      }
+    }
   }
 
   /** One tick of Burrow's contact damage (see BURROW_CONTACT_* — the descent itself is entirely
