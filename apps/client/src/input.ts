@@ -56,11 +56,16 @@ export class InputTracker {
       if (e.button === 0) {
         // A click that just selected a weapon slot (Pixi HUD, drawn on this same canvas) also
         // reaches here as a plain left-press — suppressNextFire() flags it so it doesn't shoot.
-        if (this.suppressFire) this.suppressFire = false;
-        else this.firePending = true;
-        // Separate from the firePending edge: the flamethrower streams for as long as this stays
-        // true (see main.ts). Set even on a suppressed slot-click — the release still clears it.
-        this.fireHeld = true;
+        // Suppress fireHeld too, not just the firePending edge: hold-to-fire weapons (flamethrower,
+        // grenade charge, railgun charge, minigun) poll isFireHeld() directly every tick rather than
+        // going through the one-shot edge, so leaving fireHeld true here made a slot click start
+        // them streaming/charging even though the one-shot shot itself was correctly suppressed.
+        if (this.suppressFire) {
+          this.suppressFire = false;
+        } else {
+          this.firePending = true;
+          this.fireHeld = true;
+        }
       }
       if (e.button === 2) this.grapple = true;
     });
