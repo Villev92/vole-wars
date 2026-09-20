@@ -10,7 +10,18 @@ import {
   type ProjectileSimState,
   type VoleHitTarget,
 } from "@vole-wars/shared";
-import { connect, requestTerrain, sendDig, sendFire, sendFlame, sendInput, sendRailgun } from "./net.js";
+import {
+  connect,
+  requestTerrain,
+  sendAddBot,
+  sendDeleteBot,
+  sendDig,
+  sendFire,
+  sendFlame,
+  sendInput,
+  sendRailgun,
+  sendRestartGame,
+} from "./net.js";
 import { TerrainRenderer, DIRT_COLOR, STONE_COLOR } from "./terrainRenderer.js";
 import { BloodRenderer } from "./bloodRenderer.js";
 import { createCaveBackground } from "./caveBackground.js";
@@ -1344,6 +1355,38 @@ async function main(): Promise<void> {
   // Dig ability — the gesture is detected in InputTracker; the server validates the wall/aim and
   // carves. Fire-and-forget: an invalid attempt just does nothing server-side.
   input.setDigHandler((dir) => sendDig(room, dir));
+
+  // ESC menu — Delete Bot / Add Bot / Restart Game (see GameRoom's matching onMessage handlers). A
+  // pause-style overlay: opening it releases every held key/button (see forceReleaseAll) so the vole
+  // stops moving/firing while it's up, and the full-screen backdrop's pointer-events block any stray
+  // canvas click from sneaking through. Other players are NOT paused — this only affects the local
+  // client's own input.
+  const escMenuEl = document.getElementById("esc-menu") as HTMLDivElement;
+  let menuOpen = false;
+  const setMenuOpen = (open: boolean): void => {
+    if (open === menuOpen) return;
+    menuOpen = open;
+    escMenuEl.classList.toggle("open", open);
+    if (open) input.forceReleaseAll();
+  };
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Escape") return;
+    e.preventDefault();
+    setMenuOpen(!menuOpen);
+  });
+  // Clicking the dimmed backdrop (not the panel itself) also closes it, like the hero-select's own
+  // click-through-to-dismiss conventions elsewhere.
+  escMenuEl.addEventListener("click", (e) => {
+    if (e.target === escMenuEl) setMenuOpen(false);
+  });
+  document.getElementById("esc-delete-bot")!.addEventListener("click", () => sendDeleteBot(room));
+  document.getElementById("esc-add-bot")!.addEventListener("click", () => sendAddBot(room));
+  document.getElementById("esc-restart")!.addEventListener("click", () => {
+    sendRestartGame(room);
+    setMenuOpen(false);
+  });
+  document.getElementById("esc-resume")!.addEventListener("click", () => setMenuOpen(false));
+
   // Client-side mirror of GameRoom.handleFire's own rate-of-fire cap (same weapon.fireCooldown
   // constant, same "time since last accepted fire" gate) — the server is still the one that
   // actually enforces it, this just avoids spamming useless "fire" messages during cooldown and

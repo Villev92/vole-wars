@@ -99,6 +99,25 @@ export class InputTracker {
     return this.fireHeld;
   }
 
+  /** Releases every held key/button (but leaves aimAngle alone) — used when the ESC menu opens so the
+   *  vole stops moving/firing instead of carrying in whatever was held the instant the menu popped up.
+   *  Doesn't fire onFire/onDig: this is a release, not a fresh press. The next poll() naturally reports
+   *  an idle input, and each weapon's own hold/release edge-detection in main.ts's ticker (flamethrower,
+   *  grenade charge, railgun charge) sees fireHeld drop just like a real mouseup. */
+  forceReleaseAll(): void {
+    this.left = false;
+    this.right = false;
+    this.jumpKeysHeld.clear();
+    this.jump = false;
+    this.up = false;
+    this.down = false;
+    this.dash = false;
+    this.burrow = false;
+    this.grapple = false;
+    this.fireHeld = false;
+    this.firePending = false;
+  }
+
   private handleKey(code: string, down: boolean): void {
     const isLeftKey = code === "ArrowLeft" || code === "KeyA";
     const isRightKey = code === "ArrowRight" || code === "KeyD";

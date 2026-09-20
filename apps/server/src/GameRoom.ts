@@ -235,6 +235,10 @@ export class GameRoom extends Room<GameState> {
   // full-grid rescan that produces the current figure to a few times a second.
   private terrainInitialDestructible = 1;
   private terrainStatTick = 0;
+  // ESC-menu bot management (see spawnBot/deleteRandomBot). BOT_ID is always the first bot's id;
+  // any added afterward gets `bot-N` from this counter, so ids never collide even after deletions.
+  private botIds = new Set<string>();
+  private botSeq = 0;
 
   onCreate(): void {
     this.setState(new GameState());
@@ -243,7 +247,14 @@ export class GameRoom extends Room<GameState> {
     this.terrain = TerrainField.generateCaves(ARENA_WIDTH, ARENA_HEIGHT, seed);
     this.terrainInitialDestructible = Math.max(1, this.terrain.countDestructible());
     this.state.terrainRemaining = 1;
-    this.spawnBot();
+    this.spawnBot(BOT_ID);
+
+    // ESC-menu actions (see apps/client/src/main.ts's #esc-menu) — any connected client can trigger
+    // these, there's no host/owner distinction in this game. All three are silent no-ops when the
+    // request doesn't make sense (no bot to delete, already at the player cap) rather than erroring.
+    this.onMessage("delete-bot", () => this.deleteRandomBot());
+    this.onMessage("add-bot", () => this.addBot());
+    this.onMessage("restart-game", () => this.restartGame());
 
     this.onMessage("input", (client, message: PlayerInput) => {
       this.inputs.set(client.sessionId, message);
@@ -416,11 +427,12 @@ export class GameRoom extends Room<GameState> {
     }
   }
 
-  /** Adds the always-on dummy bot vole — see BOT_ID's own comment for what it's for. Called once
-   *  from onCreate, not onJoin, since it's never a real connected client. */
-  private spawnBot(): void {
+  /** Adds a dummy bot vole at `id` — see BOT_ID's own comment for what it's for. The first one is
+   *  spawned once from onCreate (never a real connected client); ESC-menu "Add Bot" calls this again
+   *  with a fresh id from botSeq (see addBot). */
+  private spawnBot(id: string): void {
     const vole = new VoleSchema();
-    vole.id = BOT_ID;
+    vole.id = id;
     vole.displayName = "Bot";
     vole.heroId = "burrows"; // the bot always wears the built-in Burrows art
     vole.isBot = true;
@@ -429,18 +441,70 @@ export class GameRoom extends Room<GameState> {
     vole.y = spawn.y;
     vole.health = MAX_HEALTH;
     vole.alive = true;
-    this.state.voles.set(BOT_ID, vole);
-    this.fallSpawnGrace.add(BOT_ID);
+    this.state.voles.set(id, vole);
+    this.fallSpawnGrace.add(id);
+    this.botIds.add(id);
   }
 
-  private handleRespawn(sessionId: string): void {
-    // Match is over — frozen until a server restart (see memory: project-deathmatch-mode).
-    if (this.state.winnerId) return;
+  /** ESC-menu "Add Bot" — adds one more punching-bag bot like spawnBot's default one, unless doing
+   *  so would push the total player count (humans + bots) past MAX_PLAYERS. Silent no-op at the cap. */
+  private addBot(): void {
+    if (this.state.voles.size >= MAX_PLAYERS) return;
+    this.spawnBot(`bot-${++this.botSeq}`);
+  }
 
-    const vole = this.state.voles.get(sessionId);
-    // Only a dead vole can respawn — otherwise a live player could spam this into a free full heal.
-    if (!vole || vole.alive) return;
+  /** ESC-menu "Delete Bot" — removes one random bot, if any exist (the default bot spawned in
+   *  onCreate is deletable too, same as any bot added later). Silent no-op with no bots present. */
+  private deleteRandomBot(): void {
+    if (this.botIds.size === 0) return;
+    const ids = Array.from(this.botIds);
+    const id = ids[Math.floor(Math.random() * ids.length)];
+    this.botIds.delete(id);
+    this.state.voles.delete(id);
+    // Same per-vole bookkeeping cleanup onLeave does for a departing human client.
+    this.inputs.delete(id);
+    this.lastFireAt.delete(id);
+    this.stopFlaming(id);
+    this.flameDot.delete(id);
+    this.stopRailgun(id);
+    this.railDot.delete(id);
+    this.fallPeakY.delete(id);
+    this.fallSpawnGrace.delete(id);
+    this.lastGruntAt.delete(id);
+    this.burrowHitVictims.delete(id);
+  }
 
+  /** ESC-menu "Restart Game" — unfreezes a finished match, wipes every live vole's score/kills/deaths
+   *  and respawns them all fresh (bots included, reset exactly like players — see this file's own
+   *  header comment on the ESC menu), and clears transient match debris (corpses, mines, burns,
+   *  in-flight missiles/projectiles/railgun beams) left over from the previous game. Bots that were
+   *  deleted before the restart are NOT re-added; whatever bots currently exist just get reset. */
+  private restartGame(): void {
+    this.state.winnerId = "";
+
+    this.state.corpses.clear();
+    this.corpseSim.clear();
+
+    for (const id of Array.from(this.state.mines.keys())) this.removeMine(id);
+    for (const id of Array.from(this.state.missiles.keys())) this.removeMissile(id);
+    this.projectiles = [];
+
+    for (const b of this.burns) this.state.burns.delete(b.id);
+    this.burns = [];
+
+    this.railBeams.forEach((_beam, ownerId) => this.stopRailgun(ownerId));
+    this.railCharging.clear();
+    this.railDot.clear();
+    Array.from(this.flaming.keys()).forEach((id) => this.stopFlaming(id));
+    this.flameDot.clear();
+
+    this.state.voles.forEach((vole, id) => this.resetVole(id, vole, true));
+  }
+
+  /** Resets one vole to a fresh spawn — full health, cleared ability/timer state, alive — shared by
+   *  a normal death respawn (handleRespawn) and a full match restart (restartGame, which additionally
+   *  zeroes score/kills/deaths via `resetStats`). */
+  private resetVole(sessionId: string, vole: VoleSchema, resetStats: boolean): void {
     const spawn = this.findClearSpawn();
     vole.x = spawn.x;
     vole.y = spawn.y;
@@ -463,6 +527,11 @@ export class GameRoom extends Room<GameState> {
     vole.burrowStartY = 0;
     vole.burrowCooldownTimer = 0;
     vole.burrowHeld = false;
+    if (resetStats) {
+      vole.kills = 0;
+      vole.deaths = 0;
+      vole.score = 0;
+    }
     this.burrowHitVictims.delete(sessionId);
     this.stopFlaming(sessionId);
     this.flameDot.delete(sessionId);
@@ -471,8 +540,19 @@ export class GameRoom extends Room<GameState> {
     this.fallPeakY.delete(sessionId);
     this.fallSpawnGrace.add(sessionId);
     // Reset rather than leave whatever was last received — otherwise a key still held down at the
-    // moment of death would carry straight into the new spawn.
+    // moment of death (or at restart) would carry straight into the new spawn.
     this.inputs.set(sessionId, { ...IDLE_INPUT });
+  }
+
+  private handleRespawn(sessionId: string): void {
+    // Match is over — frozen until a server restart (see memory: project-deathmatch-mode).
+    if (this.state.winnerId) return;
+
+    const vole = this.state.voles.get(sessionId);
+    // Only a dead vole can respawn — otherwise a live player could spam this into a free full heal.
+    if (!vole || vole.alive) return;
+
+    this.resetVole(sessionId, vole, false);
   }
 
   private findClearSpawn(): { x: number; y: number } {

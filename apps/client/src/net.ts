@@ -43,6 +43,21 @@ export function sendRailgun(room: Room, charging: boolean, cancel = false): void
   room.send("railgun", cancel ? { charging, cancel } : { charging });
 }
 
+/** ESC-menu actions (see main.ts's #esc-menu) — fire-and-forget, any connected client can send them.
+ *  The server silently no-ops a request that doesn't make sense (no bot to delete, already at the
+ *  player cap) rather than erroring. See GameRoom's `delete-bot`/`add-bot`/`restart-game` handlers. */
+export function sendDeleteBot(room: Room): void {
+  room.send("delete-bot");
+}
+
+export function sendAddBot(room: Room): void {
+  room.send("add-bot");
+}
+
+export function sendRestartGame(room: Room): void {
+  room.send("restart-game");
+}
+
 export interface TerrainInitMessage {
   width: number;
   height: number;
